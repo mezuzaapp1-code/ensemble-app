@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Ensemble - Multi-Turn Conversations</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,sans-serif;color:#eee;display:flex;height:100vh;overflow:hidden;background:#111827;background-image:radial-gradient(circle at top left, rgba(255,255,255,0.03), transparent 30%), linear-gradient(180deg, #111827 0%, #090c14 100%)}
+
+.sidebar{width:280px;background:#1a1a2e;border-right:1px solid #21283b;display:flex;flex-direction:column;overflow-y:auto}
+.sidebar-header{padding:20px;border-bottom:1px solid #21283b}
+.sidebar-header h2{font-size:18px;margin-bottom:10px}
+.new-session-btn{width:100%;padding:10px;background:#22c55e;color:#000;border:none;border-radius:8px;cursor:pointer;font-weight:bold;font-size:13px}
+.new-session-btn:hover{background:#16a34a}
+.settings-btn{width:100%;padding:10px;background:#3b82f6;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:bold;font-size:13px;margin-top:10px}
+.settings-btn:hover{background:#2563eb}
+.sidebar-greeting{margin-top:8px;font-size:13px;color:#a5b4fc;letter-spacing:0.02em}
+
+.sessions-list{flex:1;overflow-y:auto;padding:10px}
+.session-item{padding:12px;margin-bottom:8px;background:#161826;border:1px solid #21283b;border-radius:8px;cursor:pointer;font-size:13px;transition:all 0.2s}
+.session-item:hover{border-color:#2d3a5a;background:#1a1a29}
+.session-item.active{border-color:#22c55e;background:#22362d}
+.session-item-title{font-weight:bold;margin-bottom:4px}
+.session-item-time{font-size:11px;color:#8b94a6}
+
+.main-content{flex:1;display:flex;flex-direction:column;overflow:hidden;position:relative}
+.main-content.welcome-active{justify-content:center}
+.main-content.welcome-active .chat-area{display:none}
+.main-content.welcome-active .input-area{position:absolute;left:0;right:0;top:60%;bottom:auto;transform:translateY(-50%);padding:0 20px}
+.header{padding:20px;border-bottom:1px solid #21283b;text-align:center}
+.header h1{font-size:24px;margin-bottom:8px}
+.header p{font-size:12px;color:#9ca3af}
+
+.welcome-screen{display:none;flex:1;align-items:center;justify-content:center;padding:20px}
+.welcome-screen.visible{display:flex}
+.welcome-card{max-width:700px;width:100%;padding:40px;display:flex;flex-direction:column;align-items:center;text-align:center;border:1px solid rgba(255,255,255,0.08);border-radius:24px;background:rgba(15,23,42,0.88);backdrop-filter:blur(12px);margin-bottom:120px}
+.welcome-card h1{font-size:40px;margin-bottom:12px}
+.welcome-card p{font-size:16px;color:#cbd5e1;line-height:1.6;max-width:560px;margin-bottom:24px}
+.example-chips{display:flex;flex-wrap:wrap;justify-content:center;gap:12px}
+.example-chip{padding:10px 16px;border-radius:999px;border:1px solid rgba(148,163,184,0.3);background:#111827;color:#e2e8f0;cursor:pointer;font-size:13px;transition:all 0.2s}
+.example-chip:hover{background:rgba(34,197,94,0.14);border-color:#22c55e}
+
+.chat-area{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:16px}
+
+.message-group{display:flex;flex-direction:column;gap:8px}
+
+.message{padding:14px 16px;border-radius:18px;max-width:75%;word-wrap:break-word;line-height:1.6}
+.message.user{align-self:flex-end;background:#22c55e;color:#000;font-weight:500}
+.message.assistant{align-self:flex-start;background:#141a2a;border:1px solid #21283b}
+
+.collapsible-section{align-self:flex-start;width:90%;max-width:700px;margin-top:8px}
+.collapsible-header{padding:12px 14px;background:#141a2a;border:1px solid #21283b;border-radius:10px;cursor:pointer;font-size:12px;font-weight:bold;color:#9ca3af;display:flex;justify-content:space-between;align-items:center;transition:all 0.2s}
+.collapsible-header:hover{border-color:#374151}
+.collapsible-header.open{border-bottom-left-radius:0;border-bottom-right-radius:0;background:#1f2937}
+.toggle-icon{transition:transform 0.2s;font-size:14px}
+.toggle-icon.open{transform:rotate(180deg)}
+
+.collapsible-content{max-height:0;overflow:hidden;transition:max-height 0.3s ease;background:#0f172a;border:1px solid #21283b;border-top:none;border-bottom-left-radius:10px;border-bottom-right-radius:10px}
+.collapsible-content.open{max-height:2000px;padding:16px}
+
+.rounds-container{display:flex;flex-direction:column;gap:16px}
+.round-section{border-top:1px solid #21283b;padding-top:12px}
+.round-section:first-child{border-top:none;padding-top:0}
+.round-label{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#6b7280;margin-bottom:12px}
+.round-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+
+.card{background:#141a2a;border:1px solid #21283b;border-radius:12px;padding:14px}
+.card-top{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.icon{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px}
+.card-name{font-weight:bold;font-size:12px}
+.card-role{font-size:10px;color:#6b7280}
+.card-body{font-size:12px;line-height:1.6;color:#d1d5db;max-height:220px;overflow-y:auto}
+
+.skel{height:8px;border-radius:4px;background:#21283b;margin-bottom:8px;animation:pulse 1.4s infinite}
+@keyframes pulse{0%,100%{opacity:.3}50%{opacity:.8}}
+
+.input-area{padding:20px;background:transparent;border-top:1px solid #21283b;transition:all 0.3s}
+.input-wrapper{max-width:900px;margin:0 auto;display:flex;gap:10px}
+textarea{flex:1;min-height:56px;padding:14px;border-radius:999px;border:1px solid #21283b;background:#0f172a;color:#fff;font-size:14px;font-family:Arial,sans-serif;resize:none;box-shadow:0 0 0 1px rgba(148,163,184,0.03)}
+textarea:focus{outline:none;border-color:#2563eb}
+
+.send-btn{padding:12px 24px;background:#22c55e;color:#000;border:none;border-radius:999px;cursor:pointer;font-weight:bold;font-size:13px;transition:all 0.2s;align-self:flex-end;height:56px}
+.send-btn:hover:not(:disabled){background:#16a34a}
+.send-btn:disabled{opacity:.4;cursor:not-allowed}
+
+.status{padding:10px;text-align:center;color:#f59e0b;font-size:12px;font-weight:bold;min-height:20px}
+.error{color:#f87171}
+
+.profile-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.75);display:none;align-items:center;justify-content:center;z-index:20}
+.profile-modal-backdrop.visible{display:flex}
+.profile-modal-card{width:min(540px,calc(100% - 40px));background:#0f172a;border:1px solid #273449;border-radius:24px;padding:30px;box-shadow:0 20px 60px rgba(0,0,0,0.45);}
+.profile-modal-card h2{margin-bottom:12px;font-size:26px}
+.profile-modal-card p{margin-bottom:24px;color:#cbd5e1;line-height:1.55}
+.profile-field{margin-bottom:18px}
+.profile-field label{display:block;font-size:13px;color:#94a3b8;margin-bottom:6px}
+.profile-field input,.profile-field select,.profile-field textarea{width:100%;padding:12px 14px;border-radius:14px;border:1px solid #21283b;background:#111827;color:#fff;font-size:14px;outline:none}
+.profile-field textarea{min-height:100px;resize:vertical}
+.profile-actions{display:flex;gap:12px;flex-wrap:wrap;justify-content:flex-end;margin-top:12px}
+.profile-actions button{padding:12px 18px;border:none;border-radius:999px;font-weight:bold;cursor:pointer}
+.profile-actions .save-btn{background:#22c55e;color:#000}
+.profile-actions .save-btn:hover{background:#16a34a}
+.profile-actions .cancel-btn{background:#1f2937;color:#fff}
+.profile-actions .cancel-btn:hover{background:#334155}
+
+.learning-banner{background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.2);color:#93c5fd;padding:12px;border-radius:12px;font-size:12px;display:flex;align-items:center;gap:8px;margin-bottom:16px}
+.consensus-panel{background:#0f172a;border:1px solid #1e293b;border-radius:16px;padding:16px;margin-bottom:16px}
+.consensus-header{font-size:14px;font-weight:bold;margin-bottom:12px;color:#e2e8f0;display:flex;align-items:center;gap:8px}
+.consensus-item{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid #1e293b}
+.consensus-item:last-child{border-bottom:none;padding-bottom:0}
+.consensus-claim{flex:1;font-size:13px;line-height:1.5;color:#cbd5e1}
+.badge{padding:4px 8px;border-radius:999px;font-size:10px;font-weight:bold;text-transform:uppercase;white-space:nowrap}
+.badge.high{background:rgba(34,197,94,0.1);color:#4ade80;border:1px solid rgba(34,197,94,0.2)}
+.badge.medium{background:rgba(234,179,8,0.1);color:#facc15;border:1px solid rgba(234,179,8,0.2)}
+.badge.unverified{background:rgba(148,163,184,0.1);color:#94a3b8;border:1px solid rgba(148,163,184,0.2)}
+.badge.contradiction{background:rgba(239,68,68,0.1);color:#f87171;border:1px solid rgba(239,68,68,0.2)}
+.feedback-actions{display:flex;gap:6px;margin-left:auto}
+.feedback-btn{background:transparent;border:1px solid #334155;color:#94a3b8;border-radius:6px;padding:4px 8px;font-size:12px;cursor:pointer;transition:all 0.2s}
+.feedback-btn:hover{background:#1e293b;color:#e2e8f0}
+.feedback-btn.active-up{background:rgba(34,197,94,0.15);color:#4ade80;border-color:#4ade80}
+.feedback-btn.active-down{background:rgba(239,68,68,0.15);color:#f87171;border-color:#f87171}
+</style>
+</head>
+
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-header">
+    <h2>Conversations</h2>
+    <div id="profileGreeting" class="sidebar-greeting"></div>
+    <button class="new-session-btn" onclick="createNewSession()">+ New Chat</button>
+    <button class="settings-btn" onclick="openProfileSettings()">Settings</button>
+  </div>
+  <div class="sessions-list" id="sessionsList"></div>
+</div>
+
+<div class="profile-modal-backdrop" id="profileModal">
+  <div class="profile-modal-card">
+    <h2>Welcome to AI Ensemble</h2>
+    <p>Tell us a bit about yourself so your assistant can remember your name, role, and current projects.</p>
+
+    <div class="profile-field">
+      <label for="profileName">What is your name?</label>
+      <input id="profileName" type="text" placeholder="Jane Doe" />
+    </div>
+
+    <div class="profile-field">
+      <label for="profileRole">What is your role?</label>
+      <select id="profileRole">
+        <option value="developer">Developer</option>
+        <option value="founder">Founder</option>
+        <option value="researcher">Researcher</option>
+        <option value="other">Other</option>
+      </select>
+    </div>
+
+    <div class="profile-field">
+      <label for="profileProjects">What are you working on?</label>
+      <textarea id="profileProjects" placeholder="Describe your current projects..."></textarea>
+    </div>
+
+    <div class="profile-actions">
+      <button class="cancel-btn" onclick="hideProfileModal()">Not now</button>
+      <button class="save-btn" onclick="submitProfileSetup()">Save profile</button>
+    </div>
+  </div>
+</div>
+
+<div class="main-content welcome-active" id="mainContent">
+  <div class="header">
+    <h1 id="sessionTitle">AI Ensemble</h1>
+    <p id="sessionSubtitle">Ask anything. Get answers from 3 AI models.</p>
+  </div>
+
+  <div class="welcome-screen visible" id="welcomeScreen">
+    <div class="welcome-card">
+      <h1>AI Ensemble</h1>
+      <p>Ask anything. Get answers from 3 AI models.</p>
+      <div class="example-chips">
+        <button class="example-chip" onclick="useExample('How do I design a scalable chat app?')">How do I design a scalable chat app?</button>
+        <button class="example-chip" onclick="useExample('Compare GPT, Gemini, and Claude for product strategy.')">Compare GPT, Gemini, and Claude for product strategy.</button>
+        <button class="example-chip" onclick="useExample('What are the risks of using AI in fintech?')">What are the risks of using AI in fintech?</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="chat-area" id="chatArea"></div>
+
+  <div class="status" id="status"></div>
+
+  <div class="input-area" id="inputArea">
+    <div class="input-wrapper">
+      <textarea id="userInput" placeholder="Ask anything..." spellcheck="false"></textarea>
+      <button class="send-btn" onclick="sendMessage()" id="sendBtn">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const SERVER = "";
+let currentSession = null;
+let currentProfile = null;
+
+const META = {
+  gpt:{label:"GPT", color:"#22c55e", emoji:"⚙️"},
+  gemini:{label:"Gemini", color:"#a855f7", emoji:"💻"},
+  claude:{label:"Claude", color:"#3b82f6", emoji:"🧠"}
+};
+
+// ========================
+// SESSION MANAGEMENT
+// ========================
+
+async function createNewSession(){
+  const title = prompt("Chat name:", "New Conversation");
+  if(!title) return;
+
+  try {
+    const response = await fetch(SERVER + "/session/new", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({title})
+    });
+
+    const data = await response.json();
+    if(data.success){
+      currentSession = data.session_id;
+      loadSessions();
+      loadChatHistory();
+      updateStatus("Session created");
+    }
+  } catch(err) {
+    updateStatus("Error creating session: " + err.message, true);
+  }
+}
+
+function showProfileModal(show){
+  const modal = document.getElementById("profileModal");
+  modal.classList.toggle("visible", show);
+}
+
+function hideProfileModal(){
+  showProfileModal(false);
+}
+
+function updateProfileGreeting(profile){
+  const greeting = document.getElementById("profileGreeting");
+  if(profile && profile.user_name){
+    greeting.textContent = `Hello, ${profile.user_name}`;
+  } else {
+    greeting.textContent = "";
+  }
+}
+
+function openProfileSettings(){
+  const profile = currentProfile || {};
+  document.getElementById("profileName").value = profile.user_name || "";
+  document.getElementById("profileRole").value = profile.user_role || "developer";
+  document.getElementById("profileProjects").value = profile.projects || "";
+  showProfileModal(true);
+}
+
+async function submitProfileSetup(){
+  const name = document.getElementById("profileName").value.trim();
+  const role = document.getElementById("profileRole").value;
+  const projects = document.getElementById("profileProjects").value.trim();
+
+  if(!name){
+    updateStatus("Please enter your name to continue.", true);
+    return;
+  }
+
+  try {
+    let response;
+    let data;
+
+    if(currentSession){
+      response = await fetch(SERVER + `/session/${currentSession}/profile`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          user_name: name,
+          user_role: role,
+          projects: projects
+        })
+      });
+      data = await response.json();
+    } else {
+      response = await fetch(SERVER + "/session/new", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          title: `${name}'s Workspace`,
+          user_name: name,
+          user_role: role,
+          projects: projects
+        })
+      });
+      data = await response.json();
+      if(data.success){
+        currentSession = data.session_id;
+      }
+    }
+
+    if(data.success){
+      currentProfile = data.profile || {user_name: name, user_role: role, projects: projects};
+      updateProfileGreeting(currentProfile);
+      showProfileModal(false);
+      loadSessions();
+      loadChatHistory();
+      updateStatus("Profile saved. Welcome, " + name + "!");
+    } else {
+      updateStatus("Error saving profile: " + (data.error || "Unknown error"), true);
+    }
+  } catch(err) {
+    updateStatus("Error saving profile: " + err.message, true);
+  }
+}
+
+async function loadSessions(){
+  try {
+    const response = await fetch(SERVER + "/sessions");
+    const data = await response.json();
+
+    if(data.success){
+      const list = document.getElementById("sessionsList");
+      list.innerHTML = data.sessions.map(s => `
+        <div class="session-item ${s.session_id === currentSession ? 'active' : ''}" 
+             onclick="switchSession('${s.session_id}')">
+          <div class="session-item-title">${escapeHtml(s.title)}</div>
+          <div class="session-item-time">${new Date(s.updated_at).toLocaleDateString()}</div>
+        </div>
+      `).join("");
+
+      if(!currentSession && data.sessions.length > 0){
+        currentSession = data.sessions[0].session_id;
+      }
+
+      const hasSession = Boolean(currentSession);
+      showWelcomeScreen(!hasSession);
+      showProfileModal(!hasSession);
+
+      if(hasSession){
+        loadChatHistory();
+      }
+    }
+  } catch(err) {
+    console.error("Error loading sessions:", err);
+  }
+}
+
+async function switchSession(sessionId){
+  currentSession = sessionId;
+  showWelcomeScreen(false);
+  loadSessions();
+  loadChatHistory();
+}
+
+async function loadChatHistory(){
+  if(!currentSession) return;
+
+  try {
+    const response = await fetch(SERVER + `/session/${currentSession}`);
+    const data = await response.json();
+
+    if(data.success){
+      currentProfile = data.profile || null;
+      updateProfileGreeting(currentProfile);
+      if(!currentProfile){
+        showProfileModal(true);
+      }
+      document.getElementById("sessionSubtitle").textContent =
+        `Created: ${new Date(data.created_at).toLocaleString()}`;
+
+      const chat = document.getElementById("chatArea");
+      chat.innerHTML = "";
+
+      let pendingRound1 = {gpt: "", gemini: "", claude: ""};
+      let pendingRound2 = {gpt: "", gemini: "", claude: ""};
+      let lastUserMessage = null;
+
+      data.messages.forEach(msg => {
+        if(msg.model === "ensemble" && msg.role === "user"){
+          appendUserMessage(msg.content);
+          lastUserMessage = msg.content;
+        } else if(msg.model === "ensemble-round1"){
+          pendingRound1[msg.role] = msg.content;
+        } else if(msg.model === "ensemble-round2"){
+          pendingRound2[msg.role] = msg.content;
+        } else if(msg.model === "ensemble-final" && msg.role === "assistant"){
+          appendAssistantMessage(msg.content, pendingRound1, pendingRound2, null, "technical", "");
+          pendingRound1 = {gpt: "", gemini: "", claude: ""};
+          pendingRound2 = {gpt: "", gemini: "", claude: ""};
+          lastUserMessage = null;
+        } else if(msg.role === "user"){
+          appendUserMessage(msg.content);
+          lastUserMessage = msg.content;
+        } else if(msg.role === "assistant"){
+          appendAssistantMessage(msg.content, {}, {}, null, "technical", "");
+        }
+      });
+
+      chat.scrollTop = chat.scrollHeight;
+    }
+  } catch(err) {
+    console.error("Error loading chat history:", err);
+  }
+}
+
+// ========================
+// UI HELPERS
+// ========================
+
+function escapeHtml(text){
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function updateStatus(msg, isError = false){
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = isError ? "status error" : "status";
+  if(msg) setTimeout(() => {el.textContent = ""}, 3000);
+}
+
+function showWelcomeScreen(show){
+  const main = document.getElementById("mainContent");
+  const welcome = document.getElementById("welcomeScreen");
+  const status = document.getElementById("status");
+  main.classList.toggle("welcome-active", show);
+  welcome.classList.toggle("visible", show);
+  status.style.display = show ? "none" : "block";
+}
+
+async function useExample(question){
+  if(!currentSession){
+    try {
+      const response = await fetch(SERVER + "/session/new", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({title: "Quick Start"})
+      });
+      const data = await response.json();
+      if(data.success){
+        currentSession = data.session_id;
+        loadSessions();
+        loadChatHistory();
+      }
+    } catch(err) {
+      updateStatus("Error creating quick start session: " + err.message, true);
+      return;
+    }
+  }
+
+  document.getElementById("userInput").value = question;
+  sendMessage();
+}
+
+function appendUserMessage(content){
+  const chat = document.getElementById("chatArea");
+  const group = document.createElement("div");
+  group.className = "message-group";
+  
+  const msg = document.createElement("div");
+  msg.className = "message user";
+  msg.textContent = content;
+  
+  group.appendChild(msg);
+  chat.appendChild(group);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function appendAssistantMessage(content, round1, round2, consensusData = null, category = "technical", learningStatsMsg = ""){
+  const chat = document.getElementById("chatArea");
+  const group = document.createElement("div");
+  group.className = "message-group";
+  
+  // Learning Engine Banner
+  if(learningStatsMsg) {
+    const banner = document.createElement("div");
+    banner.className = "learning-banner";
+    banner.innerHTML = `<span>🧠</span> <span>${escapeHtml(learningStatsMsg)}</span>`;
+    group.appendChild(banner);
+  }
+
+  // Consensus Map Panel
+  if(consensusData && consensusData.length > 0) {
+    const panel = document.createElement("div");
+    panel.className = "consensus-panel";
+    
+    const header = document.createElement("div");
+    header.className = "consensus-header";
+    header.innerHTML = `<span>⚖️</span> Semantic Consensus Map`;
+    panel.appendChild(header);
+
+    consensusData.forEach(item => {
+      let badgeClass = "unverified";
+      let status = (item.status || "UNVERIFIED").toUpperCase();
+      if(status.includes("HIGH")) badgeClass = "high";
+      else if(status.includes("MEDIUM")) badgeClass = "medium";
+      else if(status.includes("CONTRADIC")) badgeClass = "contradiction";
+      
+      const row = document.createElement("div");
+      row.className = "consensus-item";
+      row.innerHTML = `
+        <div class="consensus-claim">${escapeHtml(item.claim)}</div>
+        <div class="badge ${badgeClass}">${escapeHtml(item.status)}</div>
+      `;
+      panel.appendChild(row);
+    });
+    group.appendChild(panel);
+  }
+
+  // Main synthesis response
+  const msg = document.createElement("div");
+  msg.className = "message assistant";
+  msg.textContent = content;
+  group.appendChild(msg);
+  
+  // Collapsible details section
+  const collapsible = document.createElement("div");
+  collapsible.className = "collapsible-section";
+  
+  const header = document.createElement("div");
+  header.className = "collapsible-header";
+  header.onclick = () => toggleCollapsible(header, content_div);
+  header.innerHTML = `
+    <span>See how each model thought</span>
+    <span class="toggle-icon">▼</span>
+  `;
+  collapsible.appendChild(header);
+  
+  const content_div = document.createElement("div");
+  content_div.className = "collapsible-content";
+  
+  const roundsContainer = document.createElement("div");
+  roundsContainer.className = "rounds-container";
+  
+  // Round 1
+  if(round1 && Object.keys(round1).length > 0){
+    const r1Section = document.createElement("div");
+    r1Section.className = "round-section";
+    r1Section.innerHTML = `<div class="round-label">Round 1 - Initial Analysis</div>`;
+    
+    const grid = document.createElement("div");
+    grid.className = "round-grid";
+    grid.innerHTML = [
+      cardHtml("gpt", round1.gpt || "", category),
+      cardHtml("gemini", round1.gemini || "", category),
+      cardHtml("claude", round1.claude || "", category)
+    ].join("");
+    
+    r1Section.appendChild(grid);
+    roundsContainer.appendChild(r1Section);
+  }
+  
+  // Round 2
+  if(round2 && Object.keys(round2).length > 0){
+    const r2Section = document.createElement("div");
+    r2Section.className = "round-section";
+    r2Section.innerHTML = `<div class="round-label">Round 2 - Cross Critique</div>`;
+    
+    const grid = document.createElement("div");
+    grid.className = "round-grid";
+    grid.innerHTML = [
+      cardHtml("gpt", round2.gpt || "", category),
+      cardHtml("gemini", round2.gemini || "", category),
+      cardHtml("claude", round2.claude || "", category)
+    ].join("");
+    
+    r2Section.appendChild(grid);
+    roundsContainer.appendChild(r2Section);
+  }
+  
+  content_div.appendChild(roundsContainer);
+  collapsible.appendChild(content_div);
+  group.appendChild(collapsible);
+  
+  chat.appendChild(group);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function toggleCollapsible(header, content){
+  header.classList.toggle("open");
+  header.querySelector(".toggle-icon").classList.toggle("open");
+  content.classList.toggle("open");
+}
+
+async function submitFeedback(model, category, value, btn) {
+  if(!currentSession) return;
+  try {
+    const response = await fetch(SERVER + "/ensemble/feedback", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        session_id: currentSession,
+        model: model,
+        feedback_value: value,
+        category: category
+      })
+    });
+    const data = await response.json();
+    if(data.success) {
+      const parent = btn.parentElement;
+      parent.querySelectorAll('.feedback-btn').forEach(b => b.classList.remove('active-up', 'active-down'));
+      if(value === 1) btn.classList.add('active-up');
+      else btn.classList.add('active-down');
+    }
+  } catch(err) {
+    console.error("Feedback error:", err);
+  }
+}
+
+function cardHtml(model, text, category){
+  const m = META[model];
+  const safeText = escapeHtml(String(text || ""));
+  const catParam = category ? `'${category}'` : "'technical'";
+  return `
+    <div class="card">
+      <div class="card-top">
+        <div class="icon" style="background:${m.color}22">${m.emoji}</div>
+        <div>
+          <div class="card-name" style="color:${m.color}">${m.label}</div>
+        </div>
+        <div class="feedback-actions">
+          <button class="feedback-btn" onclick="submitFeedback('${model}', ${catParam}, 1, this)">👍</button>
+          <button class="feedback-btn" onclick="submitFeedback('${model}', ${catParam}, -1, this)">👎</button>
+        </div>
+      </div>
+      <div class="card-body">${safeText}</div>
+    </div>
+  `;
+}
+
+// ========================
+// SEND MESSAGE (UNIFIED)
+// ========================
+
+async function sendMessage(){
+  if(!currentSession) {
+    updateStatus("Create or select a session first", true);
+    return;
+  }
+
+  const msg = document.getElementById("userInput").value.trim();
+  if(!msg){
+    updateStatus("Enter a message", true);
+    return;
+  }
+
+  document.getElementById("sendBtn").disabled = true;
+  updateStatus("Thinking...");
+
+  try {
+    appendUserMessage(msg);
+    document.getElementById("userInput").value = "";
+
+    // Show loading state
+    const chat = document.getElementById("chatArea");
+    const group = document.createElement("div");
+    group.className = "message-group";
+    group.id = "loading-group";
+    
+    const loadingMsg = document.createElement("div");
+    loadingMsg.className = "message assistant";
+    loadingMsg.innerHTML = `
+      <div class="skel" style="width:90%"></div>
+      <div class="skel" style="width:70%"></div>
+      <div class="skel" style="width:85%"></div>
+      <br>Analyzing with all 3 models...
+    `;
+    group.appendChild(loadingMsg);
+    chat.appendChild(group);
+    chat.scrollTop = chat.scrollHeight;
+
+    // Call ensemble endpoint
+    const response = await fetch(SERVER + "/ensemble/run", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        session_id: currentSession,
+        question: msg
+      })
+    });
+
+    const data = await response.json();
+
+    if(data.success){
+      // Remove loading state
+      document.getElementById("loading-group").remove();
+      
+      // Add response with details
+      appendAssistantMessage(data.final, data.round1, data.round2, data.consensus_data, data.category, data.learning_stats_msg);
+      updateStatus("Done");
+      loadSessions();
+    } else {
+      document.getElementById("loading-group").remove();
+      updateStatus("Error: " + (data.error || "Unknown error"), true);
+    }
+  } catch(err) {
+    updateStatus("Error: " + err.message, true);
+  } finally {
+    document.getElementById("sendBtn").disabled = false;
+  }
+}
+
+// ========================
+// INITIALIZATION
+// ========================
+
+window.addEventListener("load", () => {
+  loadSessions();
+});
+
+// Enter to send
+document.addEventListener("keydown", (e) => {
+  if(e.key === "Enter" && !e.shiftKey){
+    e.preventDefault();
+    sendMessage();
+  }
+});
+</script>
+
+</body>
+</html>
