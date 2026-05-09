@@ -3,4 +3,5 @@ builder = "docker"
 
 [deploy]
 restartPolicyType = "ON_FAILURE"
-startCommand = "sh -c 'exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}'"
+# Do not wrap in single quotes — $PORT would not expand and health checks fail.
+startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
