@@ -1,7 +1,10 @@
 [build]
-builder = "docker"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
 restartPolicyType = "ON_FAILURE"
-# Do not wrap in single quotes — $PORT would not expand and health checks fail.
 startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+# Public URL health: verify /status (Founder dashboard) once the app listens on PORT.
+healthcheckPath = "/status"
+healthcheckTimeout = 180
