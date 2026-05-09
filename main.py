@@ -36,7 +36,33 @@ import uvicorn
 _BASE_DIR = Path(__file__).resolve().parent
 DOTENV_PATH = _BASE_DIR / ".env"
 DOTENV_LOADED = load_dotenv(dotenv_path=DOTENV_PATH, override=False)
-DB_PATH = str(_BASE_DIR / "conversations.db")
+
+
+def _sqlite_file_from_database_url() -> Optional[str]:
+    """Parse DATABASE_URL like sqlite:///conversations.db into an absolute path."""
+    raw = (os.getenv("DATABASE_URL") or "").strip()
+    if not raw or not raw.lower().startswith("sqlite:"):
+        return None
+    body = raw.split(":", 1)[1]
+    if body.startswith("///"):
+        path_part = body[3:]
+    elif body.startswith("//"):
+        path_part = body[2:].lstrip("/")
+    else:
+        path_part = body
+    if path_part.startswith("/") and len(path_part) > 1:
+        p = Path(path_part)
+    else:
+        p = _BASE_DIR / path_part
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return str(p.resolve())
+
+
+_db_from_env = _sqlite_file_from_database_url()
+DB_PATH = _db_from_env if _db_from_env else str((_BASE_DIR / "conversations.db").resolve())
 INDEX_HTML = _BASE_DIR / "index.html"
 
 # Canonical IDs for probes, streaming, and fallbacks (no legacy haiku / 1.5-flash).
@@ -111,8 +137,8 @@ app = FastAPI()
 
 STRIPE_CHECKOUT_URL = os.getenv("STRIPE_CHECKOUT_URL", "https://checkout.stripe.com/pay/placeholder")
 
-# Developer Bypass
-DEV_MODE = True # Set to True for Turbo Mode testing
+# Developer bypass (trial limits, etc.) — off in production; local: ENSEMBLE_DEV_MODE=1
+DEV_MODE = os.getenv("ENSEMBLE_DEV_MODE", "").strip().lower() in ("1", "true", "yes", "on")
 
 # ========================
 # DATABASE INITIALIZATION
@@ -3160,4 +3186,5 @@ except ImportError as _fe:
 
 if __name__ == "__main__":
     _port = int(os.getenv("ENSEMBLE_PORT", "8080"))
-    uvicorn.run("main:app", host="0.0.0.0", port=_port, reload=True)
+    _reload_local = os.getenv("ENSEMBLE_RELOAD", "").strip().lower() in ("1", "true", "yes", "on")
+    uvicorn.run("main:app", host="0.0.0.0", port=_port, reload=_reload_local)
