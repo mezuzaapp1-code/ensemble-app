@@ -12,7 +12,7 @@ from typing import Optional
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, Body
+from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import httpx
@@ -195,6 +195,15 @@ def init_db():
             is_pro INTEGER DEFAULT 0
         )
     """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            hit_ts REAL NOT NULL
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_session_hit ON rate_limits (session_id, hit_ts)")
     
     conn.commit()
     conn.close()
@@ -256,8 +265,73 @@ def migrate_schema():
                 pass
             tcols.add(col_name)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            hit_ts REAL NOT NULL
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_session_hit ON rate_limits (session_id, hit_ts)")
+
     conn.commit()
     conn.close()
+
+
+ENSEMBLE_RATE_LIMIT_MSG = (
+    "You've reached your limit. \n"
+    "   Upgrade to Pro for unlimited access."
+)
+
+
+def enforce_ensemble_rate_limit(session_id: str, is_pro: bool) -> None:
+    """
+    Per-session_id limits (SQLite sliding window via hit_ts timestamps).
+    Free: 10 requests/min, 100/day. Pro: 60/min, unlimited per day.
+    Raises HTTPException 429 when exceeded; inserts one row when allowed.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        conn.execute("PRAGMA busy_timeout = 6000")
+        now = time.time()
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        cutoff_prune = now - (48 * 3600)
+        cur.execute("DELETE FROM rate_limits WHERE hit_ts < ?", (cutoff_prune,))
+        minute_ago = now - 60.0
+        day_ago = now - (24 * 3600)
+        per_min_cap = 60 if is_pro else 10
+
+        cur.execute(
+            "SELECT COUNT(*) FROM rate_limits WHERE session_id = ? AND hit_ts > ?",
+            (sid, minute_ago),
+        )
+        n_min = int(cur.fetchone()[0])
+        if n_min >= per_min_cap:
+            conn.rollback()
+            raise HTTPException(status_code=429, detail=ENSEMBLE_RATE_LIMIT_MSG)
+
+        if not is_pro:
+            cur.execute(
+                "SELECT COUNT(*) FROM rate_limits WHERE session_id = ? AND hit_ts > ?",
+                (sid, day_ago),
+            )
+            if int(cur.fetchone()[0]) >= 100:
+                conn.rollback()
+                raise HTTPException(status_code=429, detail=ENSEMBLE_RATE_LIMIT_MSG)
+
+        cur.execute("INSERT INTO rate_limits (session_id, hit_ts) VALUES (?, ?)", (sid, now))
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def consensus_agreement_pct(consensus_data) -> float:
@@ -2046,7 +2120,9 @@ async def run_ensemble(req: RunRequest):
                 "trial_exceeded": True,
                 "trial_count": trial_count
             }
-            
+
+        enforce_ensemble_rate_limit(req.session_id, bool(is_pro))
+
         # Save user question
         save_message(req.session_id, "ensemble", "user", req.question)
         
@@ -2373,6 +2449,8 @@ Find contradictions, shallow thinking, hidden assumptions, strategic weaknesses,
             "timestamp": datetime.now().isoformat()
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "success": False,
@@ -2466,6 +2544,30 @@ async def tools_similar_ai(req: SimilarAIToolsRequest):
 async def run_ensemble_stream(req: RunRequest):
     """NDJSON stream: parallel Round 1 token streams, provisional BEN drafts, then consensus + R2 + final BEN."""
 
+    profile = get_profile(req.session_id)
+    user_id = profile.get("user_name", "anonymous") if profile else "anonymous"
+    conn_pre = sqlite3.connect(DB_PATH)
+    c_pre = conn_pre.cursor()
+    c_pre.execute("SELECT trial_count, is_pro FROM trial_usage WHERE user_identifier = ?", (user_id,))
+    row_pre = c_pre.fetchone()
+    trial_count_pre = 0
+    is_pro_pre = 0
+    if row_pre:
+        trial_count_pre, is_pro_pre = int(row_pre[0]), int(row_pre[1] or 0)
+    else:
+        c_pre.execute("INSERT INTO trial_usage (user_identifier, trial_count) VALUES (?, 0)", (user_id,))
+        conn_pre.commit()
+    conn_pre.close()
+
+    if not is_pro_pre and trial_count_pre >= 3 and not DEV_MODE:
+        async def trial_exceeded_gen():
+            payload = {"success": False, "error": "Trial Exceeded", "trial_exceeded": True}
+            yield f"data: {json.dumps(payload)}\n\n"
+
+        return StreamingResponse(trial_exceeded_gen(), media_type="text/event-stream")
+
+    enforce_ensemble_rate_limit(req.session_id, bool(is_pro_pre))
+
     async def event_generator():
         category = "technical"
         token_saver_mode = "FULL"
@@ -2478,18 +2580,8 @@ async def run_ensemble_stream(req: RunRequest):
             # SSE framing: one JSON event per data line
             return f"data: {json.dumps(payload)}\n\n"
         try:
-            profile = get_profile(req.session_id)
-            user_id = profile.get("user_name", "anonymous") if profile else "anonymous"
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
-            c.execute("SELECT trial_count, is_pro FROM trial_usage WHERE user_identifier = ?", (user_id,))
-            row = c.fetchone()
-            trial_count, is_pro = (row[0], row[1]) if row else (0, 0)
-
-            if not is_pro and trial_count >= 3 and not DEV_MODE:
-                yield emit({"success": False, "error": "Trial Exceeded", "trial_exceeded": True})
-                return
-
             c.execute(
                 "UPDATE trial_usage SET trial_count = trial_count + 1 WHERE user_identifier = ?", (user_id,)
             )
