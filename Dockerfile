@@ -9,8 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Railway injects PORT at runtime. Local Docker without PORT defaults to 8080.
-# Shell form expands $PORT — no --reload in production.
+# Railway sets PORT; default 8080 for local Docker.
 EXPOSE 8080
 
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

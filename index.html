@@ -1556,7 +1556,8 @@ function appendAssistantMessage(content, round1, round2, consensusData = null, c
   const smartTools = [
     { title: "Generate code", icon: "fa-bolt", action: () => runSmartTool('generate_code', content, smartToolbar) },
     { title: "Research examples", icon: "fa-magnifying-glass", action: () => runSmartTool('research_examples', content, smartToolbar) },
-    { title: "Export PDF", icon: "fa-file-pdf", action: () => runSmartTool('export_pdf', content, smartToolbar) }
+    { title: "Export PDF", icon: "fa-file-pdf", action: () => runSmartTool('export_pdf', content, smartToolbar) },
+    { title: "Review Auto-Fix", icon: "fa-wand-magic-sparkles", action: () => window.open('/review-auto-fix', '_blank', 'noopener,noreferrer') }
   ];
 
   smartTools.forEach(t => {

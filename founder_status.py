@@ -3,8 +3,8 @@ Founder's Control Suite: /status dashboard, APIs, error ring, git auditor, backu
 """
 from __future__ import annotations
 
+import html as html_escape
 import os
-import sqlite3
 import subprocess
 import sys
 import zipfile
@@ -15,6 +15,14 @@ from typing import Any, Callable, Awaitable, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+from ensemble_db import (
+    adapt as db_adapt,
+    sql_created_after_interval_days,
+    sql_date_bucket_expr,
+    sql_order_by_datetime_desc,
+    sql_today_predicate,
+)
 
 # --- Error ring (last 50 raw; dashboard shows last 3 translated) ---
 _ERROR_RING: deque = deque(maxlen=50)
@@ -112,11 +120,10 @@ def append_changelog_if_dirty(base: Path) -> None:
 
 # --- Telemetry reads (table created in main.migrate_schema) -------------------
 
-def _truth_consensus_pct(conn: sqlite3.Connection) -> float:
+def _truth_consensus_pct(conn: Any) -> float:
     c = conn.cursor()
-    c.execute(
-        "SELECT AVG(consensus_pct) FROM telemetry_runs WHERE created_at > datetime('now', '-30 day')"
-    )
+    win = sql_created_after_interval_days("created_at", 30)
+    c.execute(db_adapt(f"SELECT AVG(consensus_pct) FROM telemetry_runs WHERE {win}"))
     row = c.fetchone()
     v = row[0]
     if v is None:
@@ -124,21 +131,32 @@ def _truth_consensus_pct(conn: sqlite3.Connection) -> float:
     return round(float(v), 1)
 
 
-def _cfo_from_db(conn: sqlite3.Connection) -> dict:
+def _cfo_from_db(conn: Any) -> dict:
     c = conn.cursor()
+    bucket = sql_date_bucket_expr("created_at")
+    w14 = sql_created_after_interval_days("created_at", 14)
     c.execute(
-        """
-        SELECT date(created_at) AS d,
+        db_adapt(
+            f"""
+        SELECT {bucket} AS d,
                SUM(openai_usd) AS o, SUM(gemini_usd) AS g, SUM(anthropic_usd) AS a,
                SUM(cost_usd) AS t, SUM(savings_usd) AS s
         FROM telemetry_runs
-        WHERE created_at > datetime('now', '-14 day')
-        GROUP BY date(created_at)
+        WHERE {w14}
+        GROUP BY {bucket}
         ORDER BY d DESC
         """
+        )
     )
     daily_rows = [
-        {"date": r[0], "openai_usd": r[1] or 0, "gemini_usd": r[2] or 0, "anthropic_usd": r[3] or 0, "total_usd": r[4] or 0, "savings_usd": r[5] or 0}
+        {
+            "date": str(r[0]),
+            "openai_usd": r[1] or 0,
+            "gemini_usd": r[2] or 0,
+            "anthropic_usd": r[3] or 0,
+            "total_usd": r[4] or 0,
+            "savings_usd": r[5] or 0,
+        }
         for r in c.fetchall()
     ]
 
@@ -153,16 +171,19 @@ def _cfo_from_db(conn: sqlite3.Connection) -> dict:
     total_baseline = float(agg[1] or 0)
     total_spent = float(agg[2] or 0)
 
-    # 7-day average daily burn (all providers)
+    bucket7 = sql_date_bucket_expr("created_at")
+    w7 = sql_created_after_interval_days("created_at", 7)
     c.execute(
-        """
+        db_adapt(
+            f"""
         SELECT AVG(day_total) FROM (
-            SELECT date(created_at) AS d, SUM(cost_usd) AS day_total
+            SELECT {bucket7} AS d, SUM(cost_usd) AS day_total
             FROM telemetry_runs
-            WHERE created_at > datetime('now', '-7 day')
-            GROUP BY date(created_at)
-        )
+            WHERE {w7}
+            GROUP BY {bucket7}
+        ) sub
         """
+        )
     )
     avg_daily = c.fetchone()[0]
     avg_daily = float(avg_daily) if avg_daily is not None else 0.0
@@ -195,7 +216,7 @@ def _cfo_from_db(conn: sqlite3.Connection) -> dict:
     }
 
 
-def _performance_from_db(conn: sqlite3.Connection) -> dict:
+def _performance_from_db(conn: Any) -> dict:
     """Today’s ensemble timing + routing mix from telemetry_runs."""
     empty = {
         "runs_today": 0,
@@ -209,12 +230,14 @@ def _performance_from_db(conn: sqlite3.Connection) -> dict:
         "routing_pct": {"Economy": None, "Standard": None, "Premium": None},
     }
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM telemetry_runs WHERE date(created_at) = date('now')")
+    today_w = sql_today_predicate("created_at")
+    c.execute(db_adapt(f"SELECT COUNT(*) FROM telemetry_runs WHERE {today_w}"))
     n = int((c.fetchone() or [0])[0])
     if n <= 0:
         return empty
     c.execute(
-        """
+        db_adapt(
+            f"""
         SELECT
           AVG(CASE WHEN r1_gpt_ms IS NOT NULL AND r1_gpt_ms > 0 THEN r1_gpt_ms END),
           AVG(CASE WHEN r1_gemini_ms IS NOT NULL AND r1_gemini_ms > 0 THEN r1_gemini_ms END),
@@ -222,8 +245,9 @@ def _performance_from_db(conn: sqlite3.Connection) -> dict:
           AVG(parallel_efficiency_pct),
           SUM(CASE WHEN COALESCE(streaming_active, 1) = 1 THEN 1 ELSE 0 END),
           SUM(CASE WHEN COALESCE(fast_first_active, 1) = 1 THEN 1 ELSE 0 END)
-        FROM telemetry_runs WHERE date(created_at) = date('now')
+        FROM telemetry_runs WHERE {today_w}
         """
+        )
     )
     row = c.fetchone() or (None,) * 6
     avg_gpt, avg_ge, avg_cl = row[0], row[1], row[2]
@@ -247,21 +271,25 @@ def _performance_from_db(conn: sqlite3.Connection) -> dict:
     fast_pct = round(100.0 * fast_hits / n, 1) if n else None
 
     c.execute(
-        """
+        db_adapt(
+            f"""
         SELECT MAX(ensemble_wall_ms), MIN(ensemble_wall_ms)
         FROM telemetry_runs
-        WHERE date(created_at) = date('now') AND ensemble_wall_ms IS NOT NULL
+        WHERE {today_w} AND ensemble_wall_ms IS NOT NULL
         """
+        )
     )
     smin = c.fetchone()
     slowest_ms = round(float(smin[0]), 2) if smin and smin[0] is not None else None
     fastest_ms = round(float(smin[1]), 2) if smin and smin[1] is not None else None
 
     c.execute(
-        """
+        db_adapt(
+            f"""
         SELECT routing_tier, COUNT(*) FROM telemetry_runs
-        WHERE date(created_at) = date('now') GROUP BY routing_tier
+        WHERE {today_w} GROUP BY routing_tier
         """
+        )
     )
     tier_rows = c.fetchall()
     buckets = {"Economy": 0, "Standard": 0, "Premium": 0, "_other": 0}
@@ -305,6 +333,119 @@ def _truth_message(pct: float) -> str:
     if pct < 50:
         return "🛡️ Low Agreement: Keep Full Ensemble Active"
     return "Moderate agreement — adjust Token Saver to your workload."
+
+
+_JWT_PLACEHOLDER = "ensemble-development-jwt-signing-secret-min-length-thirty-two"
+
+
+def _env_nonempty(name: str) -> bool:
+    return bool((os.getenv(name) or "").strip())
+
+
+def railway_config_env_dashboard() -> dict:
+    jwt_raw = (os.getenv("JWT_SECRET") or "").strip()
+    jwt_secure = bool(jwt_raw) and jwt_raw != _JWT_PLACEHOLDER
+
+    def mk(
+        *,
+        env_key_display: str,
+        label: str,
+        present: bool,
+        group: str,
+        optional: bool = False,
+        note: str = "",
+    ) -> dict:
+        return {
+            "env_key_display": env_key_display,
+            "label": label,
+            "present": present,
+            "group": group,
+            "optional": optional,
+            "note": note,
+        }
+
+    port_ok = _env_nonempty("PORT") or _env_nonempty("ENSEMBLE_PORT")
+    checks: list[dict] = [
+        mk(
+            env_key_display="OPENAI_API_KEY",
+            label="OpenAI · GPT lanes",
+            present=_env_nonempty("OPENAI_API_KEY"),
+            group="Model providers",
+        ),
+        mk(
+            env_key_display="GEMINI_KEY",
+            label="Google · Gemini lanes",
+            present=_env_nonempty("GEMINI_KEY"),
+            group="Model providers",
+        ),
+        mk(
+            env_key_display="ANTHROPIC_API_KEY",
+            label="Anthropic · Claude · BEN",
+            present=_env_nonempty("ANTHROPIC_API_KEY"),
+            group="Model providers",
+        ),
+        mk(
+            env_key_display="JWT_SECRET",
+            label="JWT signing secret",
+            present=jwt_secure,
+            group="Auth / security",
+            note="Production should set a unique strong secret (not the dev fallback).",
+        ),
+        mk(
+            env_key_display="PORT (+ ENSEMBLE_PORT locally)",
+            label="Listen port",
+            present=port_ok,
+            group="Runtime",
+            note="Railway sets PORT; local dev may use ENSEMBLE_PORT.",
+        ),
+        mk(
+            env_key_display="DATABASE_URL",
+            label="SQLite / database URL",
+            present=_env_nonempty("DATABASE_URL"),
+            group="Data",
+            optional=True,
+            note="Optional — app defaults to SQLite next to main.py.",
+        ),
+        mk(
+            env_key_display="TAVILY_API_KEY",
+            label="Market / competitor web search",
+            present=_env_nonempty("TAVILY_API_KEY"),
+            group="Enhancements",
+            optional=True,
+        ),
+        mk(
+            env_key_display="FOUNDER_API_BUDGET_USD",
+            label="Founder runway budget hint",
+            present=_env_nonempty("FOUNDER_API_BUDGET_USD"),
+            group="Enhancements",
+            optional=True,
+        ),
+        mk(
+            env_key_display="ENSEMBLE_ANALYZER_MODEL",
+            label="Consensus analyzer routing",
+            present=_env_nonempty("ENSEMBLE_ANALYZER_MODEL"),
+            group="Enhancements",
+            optional=True,
+            note="Optional — omit to use default analyzer lane (gpt-fast).",
+        ),
+    ]
+    core = [c for c in checks if not c.get("optional")]
+    core_missing = sum(1 for c in core if not c["present"])
+    return {
+        "checks": checks,
+        "core_required_missing": core_missing,
+        "jwt_using_placeholder": bool(jwt_raw) and jwt_raw == _JWT_PLACEHOLDER,
+    }
+
+
+def self_heals_today_count(conn: Any) -> int:
+    c = conn.cursor()
+    try:
+        tw = sql_today_predicate("created_at")
+        c.execute(db_adapt(f"SELECT COUNT(*) FROM self_heals WHERE {tw}"))
+        return int((c.fetchone() or [0])[0])
+    except Exception:
+        return 0
 
 
 def _model_strings_for_display(model_registry: dict) -> dict[str, list[str]]:
@@ -396,7 +537,7 @@ def extract_stable_zip(base: Path, zip_path: Path) -> None:
 
 
 def restart_server_after_restore(base: Path) -> None:
-    port = os.getenv("ENSEMBLE_PORT", "8080")
+    port = (os.environ.get("PORT") or os.getenv("ENSEMBLE_PORT") or "8080").strip()
     exe = sys.executable
     args = [exe, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", port]
     creationflags = 0
@@ -416,7 +557,7 @@ def register_founders_routes(
     app: Any,
     *,
     base_dir: Path,
-    db_path: str,
+    db_connect: Callable[[], Any],
     model_registry: dict,
     run_credit_probe: Callable[..., Awaitable[dict]],
 ) -> None:
@@ -432,17 +573,21 @@ def register_founders_routes(
     @router.get("/api/founder/dashboard")
     async def founder_dashboard():
         checks = await run_credit_probe(emit_logs=False)
-        conn = sqlite3.connect(db_path)
+        conn = db_connect()
         n_runs = 0
+        heals_today = 0
         try:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM telemetry_runs")
+            cur.execute(db_adapt("SELECT COUNT(*) FROM telemetry_runs"))
             n_runs = int(cur.fetchone()[0] or 0)
             pct = _truth_consensus_pct(conn) if n_runs else 0.0
             cfo = _cfo_from_db(conn)
             performance = _performance_from_db(conn)
+            heals_today = self_heals_today_count(conn)
         finally:
             conn.close()
+
+        railway_env = railway_config_env_dashboard()
 
         if n_runs == 0:
             truth_tip = "No consensus data yet — run a few ensemble chats to fill the truth meter."
@@ -461,6 +606,11 @@ def register_founders_routes(
                 "detail_preview": (str(meta.get("detail", ""))[:160]),
             }
 
+        exec_line = (
+            f"BEN improved its logic {heals_today} time{'s' if heals_today != 1 else ''} today "
+            "based on model disagreements."
+        )
+
         return JSONResponse(
             {
                 "health": health,
@@ -471,8 +621,60 @@ def register_founders_routes(
                 "performance": performance,
                 "auditor": {"uncommitted_files": auditor_summaries},
                 "errors": get_last_errors_translated(3),
+                "railway_env": railway_env,
+                "self_heals_today": heals_today,
+                "self_heal_exec_line": exec_line,
             }
         )
+
+    @router.get("/review-auto-fix", response_class=HTMLResponse)
+    async def review_auto_fix_page():
+        conn = db_connect()
+        rows: list[tuple[Any, ...]] = []
+        try:
+            cur = conn.cursor()
+            ob = sql_order_by_datetime_desc("created_at")
+            cur.execute(
+                db_adapt(
+                    f"""
+                SELECT created_at, telemetry_run_id, consensus_pct, rationale, instruction_addendum
+                FROM self_heals ORDER BY {ob} LIMIT 120
+                """
+                )
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        lis = ""
+        if not rows:
+            lis = "<li>No self-heals recorded yet. When ensemble consensus stays under 50% on a run, the Analyzer may append a learned line to guide BEN.</li>"
+        else:
+            for created_at, tr_id, cons_pct, rationale, instr in rows:
+                ra = html_escape.escape(str(rationale or ""))
+                ins = html_escape.escape(str(instr or ""))
+                lis += (
+                    f"<li><strong>{html_escape.escape(str(created_at))}</strong> · "
+                    f"telemetry #{int(tr_id or 0)} · consensus was {cons_pct}%<br/>"
+                    f"<em>Rationale:</em> {ra}<br/>"
+                    f"<strong>Applied instruction:</strong><br/><code>{ins}</code></li>"
+                )
+        body = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><title>Review Auto-Fix</title>
+<style>
+body {{ font-family: system-ui,sans-serif; background:#0c0d10;color:#e8e9ec;line-height:1.5; padding:28px 20px 60px; max-width:760px;margin:0 auto; }}
+h1 {{ font-size:1.25rem; margin:0 0 12px; }}
+p {{ color:#8b909a;font-size:.95rem;margin:0 0 20px; }}
+a {{ color:#6366f1; }}
+ul {{ padding-left:1.15rem; }}
+li {{ margin-bottom:16px; }}
+code {{ display:block; white-space:pre-wrap; background:#15171c; border:1px solid #252830; padding:10px; border-radius:8px; font-size:.85rem; margin-top:6px; }}
+</style></head><body>
+<a href="/status">← Status dashboard</a>
+<h1>Review Auto-Fix</h1>
+<p>Each entry is an automatic instruction line appended to <code>system_instructions.txt</code> and folded into BEN’s system prompt so similar disagreements are handled more consistently next time.</p>
+<ul>{lis}</ul>
+</body></html>"""
+        return HTMLResponse(body)
 
     @router.post("/api/founder/backup")
     async def api_backup():

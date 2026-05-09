@@ -90,13 +90,32 @@
     .tick { font-size: 0.8rem; color: var(--muted); margin-top: 16px; }
     a.home { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
     a.home:hover { text-decoration: underline; }
+    .exec-banner { font-size: 1.05rem; color: var(--text); margin: 0 0 4px; }
+    .muted { font-size: 0.82rem; color: var(--muted); margin-bottom: 0; }
+    .cfg-row {
+      font-size: 0.82rem;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .dot.neutral {
+      opacity: 0.45;
+      background: var(--muted);
+      color: var(--muted);
+      box-shadow: none;
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <a class="home" href="/">← Back to chat</a>
+    <a class="home" href="/">← Back to chat</a> · <a class="home" href="/review-auto-fix">Review auto-fix history</a>
     <h1>Founder’s Control</h1>
     <p class="sub">Health, spend, agreement signals, and change history. Updates every 60 seconds.</p>
+    <p class="exec-banner" id="execSelfHealBanner">Loading self-heals…</p>
 
     <div class="grid">
       <section>
@@ -119,6 +138,23 @@
           <h2>Token saver savings</h2>
           <div id="savingsMount" style="font-size:0.92rem;color:var(--muted);">…</div>
         </div>
+      </section>
+
+      <section>
+        <h2>Speed & performance (today)</h2>
+        <div id="perfMount"></div>
+      </section>
+
+      <section>
+        <h2>Config check (Railway / env)</h2>
+        <p class="muted" style="margin:0 0 12px;">Presence only — secrets are never shown.</p>
+        <div id="configMount"></div>
+        <p class="muted" id="configSummary" style="margin-top:12px;"></p>
+      </section>
+
+      <section>
+        <h2>Founder’s playbook</h2>
+        <p class="muted" style="margin:16px 0 0;"><strong>New or rotated API key on Railway:</strong> open your project → select the running service → <strong>Variables</strong> → add or edit the variable name (<code style="color:var(--accent)">OPENAI_API_KEY</code>, <code style="color:var(--accent)">GEMINI_KEY</code>, or <code style="color:var(--accent)">ANTHROPIC_API_KEY</code>) → paste the new secret → redeploy so the container reloads env.</p>
       </section>
 
       <section class="auditor">
@@ -311,6 +347,55 @@
       mount.appendChild(kv);
     }
 
+    function renderExecSelfHeal(data) {
+      const b = document.getElementById("execSelfHealBanner");
+      const line = data.self_heal_exec_line ||
+        ("BEN improved its logic " + (data.self_heals_today || 0) + " time(s) today based on model disagreements.");
+      b.textContent = line;
+    }
+
+    function renderConfigDash(data) {
+      const cfg = data.railway_env || {};
+      const mount = document.getElementById("configMount");
+      const summary = document.getElementById("configSummary");
+      mount.innerHTML = "";
+      summary.textContent = "";
+      const checks = cfg.checks || [];
+      checks.forEach(c => {
+        const opt = !!c.optional;
+        const pres = !!c.present;
+        const dotClass = opt && !pres ? "neutral" : pres ? "ok" : "bad";
+        const st = opt && !pres ? "default (unset)" : pres ? "set" : "missing";
+        const row = el("div", { class: "cfg-row" }, []);
+        row.appendChild(el("div", { style: "display:flex;align-items:center;gap:10px;" }, [
+          el("span", { class: "dot " + dotClass }),
+          document.createTextNode((c.label || "") + " "),
+          el("span", {
+            style: "color:var(--muted);font-size:0.78rem;",
+            html: "[" + (c.env_key_display || "?") + "]"
+          }),
+        ]));
+        row.appendChild(el("strong", {}, [document.createTextNode(st)]));
+        mount.appendChild(row);
+        if (c.note) {
+          mount.appendChild(el("div", {
+            class: "muted",
+            style: "margin:-4px 0 10px;padding-left:24px;font-size:0.76rem;line-height:1.35;",
+            html: c.note,
+          }));
+        }
+      });
+      const miss = cfg.core_required_missing;
+      if (typeof miss === "number" && miss > 0) {
+        summary.innerHTML =
+          `<span style="color:var(--red);font-weight:600">${miss} core variable(s) missing.</span> Providers + secure JWT must be wired for production.`;
+      } else if (cfg.jwt_using_placeholder) {
+        summary.innerHTML = '<span style="color:var(--yellow);font-weight:600">JWT_SECRET is present but equals the insecure dev default.</span> Set a strong secret before going public.';
+      } else {
+        summary.textContent = "Core connectivity variables look present (verify values in Railway, not shown here).";
+      }
+    }
+
     function renderErr(list) {
       const mount = document.getElementById("errMount");
       mount.innerHTML = "";
@@ -336,6 +421,8 @@
         document.getElementById("truthPct").textContent = (data.truth_consensus_pct != null ? data.truth_consensus_pct + "%" : "—");
         document.getElementById("truthMsg").textContent = data.truth_message || "";
         renderCfo(data.cfo);
+        renderExecSelfHeal(data);
+        renderConfigDash(data);
         renderPerf(data);
         renderAuditor((data.auditor && data.auditor.uncommitted_files) || []);
         renderErr(data.errors || []);

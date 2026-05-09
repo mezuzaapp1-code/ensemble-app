@@ -1,17 +1,28 @@
 import os
 import uuid
-import sqlite3
 import json
 import asyncio
+import re
 import subprocess
 import tempfile
 import time
 import io
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from ensemble_db import (
+    USE_POSTGRES,
+    adapt as sqlq,
+    connect_db,
+    is_unique_violation,
+    init_db_tables,
+    migrate_schema as migrate_db_schema,
+    now_expr_insert,
+    SQLITE_DB_PATH,
+)
 import bcrypt
 import jwt
 from fastapi import Depends, FastAPI, UploadFile, File, Form, Body, HTTPException
@@ -38,31 +49,8 @@ DOTENV_PATH = _BASE_DIR / ".env"
 DOTENV_LOADED = load_dotenv(dotenv_path=DOTENV_PATH, override=False)
 
 
-def _sqlite_file_from_database_url() -> Optional[str]:
-    """Parse DATABASE_URL like sqlite:///conversations.db into an absolute path."""
-    raw = (os.getenv("DATABASE_URL") or "").strip()
-    if not raw or not raw.lower().startswith("sqlite:"):
-        return None
-    body = raw.split(":", 1)[1]
-    if body.startswith("///"):
-        path_part = body[3:]
-    elif body.startswith("//"):
-        path_part = body[2:].lstrip("/")
-    else:
-        path_part = body
-    if path_part.startswith("/") and len(path_part) > 1:
-        p = Path(path_part)
-    else:
-        p = _BASE_DIR / path_part
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    return str(p.resolve())
-
-
-_db_from_env = _sqlite_file_from_database_url()
-DB_PATH = _db_from_env if _db_from_env else str((_BASE_DIR / "conversations.db").resolve())
+# Local SQLite file path when not on Postgres (for logging / founder display)
+DB_PATH = SQLITE_DB_PATH
 INDEX_HTML = _BASE_DIR / "index.html"
 
 # Canonical IDs for probes, streaming, and fallbacks (no legacy haiku / 1.5-flash).
@@ -141,189 +129,8 @@ STRIPE_CHECKOUT_URL = os.getenv("STRIPE_CHECKOUT_URL", "https://checkout.stripe.
 DEV_MODE = os.getenv("ENSEMBLE_DEV_MODE", "").strip().lower() in ("1", "true", "yes", "on")
 
 # ========================
-# DATABASE INITIALIZATION
+# DATABASE INITIALIZATION (ensemble_db: SQLite or PostgreSQL from DATABASE_URL)
 # ========================
-
-def init_db():
-    """Initialize SQLite database for persistent conversation storage"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Sessions table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            created_at TEXT,
-            updated_at TEXT,
-            title TEXT
-        )
-    """)
-    
-    # Messages table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            model TEXT,
-            role TEXT,
-            content TEXT,
-            timestamp TEXT,
-            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-        )
-    """)
-    
-    # User profile / memory table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            session_id TEXT PRIMARY KEY,
-            user_name TEXT,
-            user_role TEXT,
-            projects TEXT,
-            preferences TEXT,
-            memory_context TEXT,
-            uploaded_text TEXT,
-            updated_at TEXT,
-            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-        )
-    """)
-    
-    # Ensemble results table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS ensemble_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            question TEXT,
-            round1_gpt TEXT,
-            round1_gemini TEXT,
-            round1_claude TEXT,
-            round2_gpt TEXT,
-            round2_gemini TEXT,
-            round2_claude TEXT,
-            final_synthesis TEXT,
-            created_at TEXT,
-            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-        )
-    """)
-    
-    # Learning Engine Feedback table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS learning_feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT,
-            model TEXT,
-            feedback_value INTEGER,
-            timestamp TEXT
-        )
-    """)
-    
-    # Trial Usage table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS trial_usage (
-            user_identifier TEXT PRIMARY KEY,
-            trial_count INTEGER DEFAULT 0,
-            is_pro INTEGER DEFAULT 0
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS rate_limits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            hit_ts REAL NOT NULL
-        )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_session_hit ON rate_limits (session_id, hit_ts)")
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
-    
-    conn.commit()
-    conn.close()
-
-
-def migrate_schema():
-    """Add optional columns to existing installs (SQLite)."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("PRAGMA table_info(profiles)")
-    cols = {row[1] for row in c.fetchall()}
-    if "uploaded_text" not in cols:
-        try:
-            c.execute("ALTER TABLE profiles ADD COLUMN uploaded_text TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "active_tools" not in cols:
-        try:
-            c.execute("ALTER TABLE profiles ADD COLUMN active_tools TEXT")
-        except sqlite3.OperationalError:
-            pass
-
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS telemetry_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            consensus_pct REAL NOT NULL DEFAULT 0,
-            cost_usd REAL DEFAULT 0,
-            baseline_cost_usd REAL DEFAULT 0,
-            savings_usd REAL DEFAULT 0,
-            mode TEXT,
-            openai_usd REAL DEFAULT 0,
-            gemini_usd REAL DEFAULT 0,
-            anthropic_usd REAL DEFAULT 0
-        )
-        """
-    )
-    c.execute("PRAGMA table_info(telemetry_runs)")
-    tcols = {row[1] for row in c.fetchall()}
-    for col_sql in (
-        "ALTER TABLE telemetry_runs ADD COLUMN ensemble_wall_ms REAL",
-        "ALTER TABLE telemetry_runs ADD COLUMN r1_parallel_wall_ms REAL",
-        "ALTER TABLE telemetry_runs ADD COLUMN r1_gpt_ms REAL",
-        "ALTER TABLE telemetry_runs ADD COLUMN r1_gemini_ms REAL",
-        "ALTER TABLE telemetry_runs ADD COLUMN r1_claude_ms REAL",
-        "ALTER TABLE telemetry_runs ADD COLUMN parallel_efficiency_pct REAL",
-        "ALTER TABLE telemetry_runs ADD COLUMN routing_tier TEXT",
-        "ALTER TABLE telemetry_runs ADD COLUMN streaming_active INTEGER DEFAULT 1",
-        "ALTER TABLE telemetry_runs ADD COLUMN fast_first_active INTEGER DEFAULT 1",
-        "ALTER TABLE telemetry_runs ADD COLUMN first_token_ms REAL",
-        "ALTER TABLE telemetry_runs ADD COLUMN question_len INTEGER",
-    ):
-        col_name = col_sql.split("ADD COLUMN ")[1].split(" ")[0]
-        if col_name not in tcols:
-            try:
-                c.execute(col_sql)
-            except sqlite3.OperationalError:
-                pass
-            tcols.add(col_name)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS rate_limits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            hit_ts REAL NOT NULL
-        )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_session_hit ON rate_limits (session_id, hit_ts)")
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
 
 JWT_EXPIRATION_SECONDS = int(os.getenv("JWT_EXPIRATION_SECONDS", str(24 * 3600)))
 auth_scheme = HTTPBearer(auto_error=False)
@@ -381,9 +188,9 @@ def require_login(
     except (jwt.PyJWTError, TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Please login")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE id = ?", (uid,))
+    xe(c, "SELECT id FROM users WHERE id = ?", (uid,))
     row = c.fetchone()
     conn.close()
     if not row:
@@ -406,19 +213,24 @@ def enforce_ensemble_rate_limit(session_id: str, is_pro: bool) -> None:
     sid = str(session_id or "").strip()
     if not sid:
         return
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn = connect_db(timeout=10.0)
     try:
-        conn.execute("PRAGMA busy_timeout = 6000")
+        if not USE_POSTGRES:
+            conn.execute("PRAGMA busy_timeout = 6000")
         now = time.time()
-        conn.execute("BEGIN IMMEDIATE")
         cur = conn.cursor()
+        if USE_POSTGRES:
+            cur.execute("BEGIN")
+        else:
+            conn.execute("BEGIN IMMEDIATE")
         cutoff_prune = now - (48 * 3600)
-        cur.execute("DELETE FROM rate_limits WHERE hit_ts < ?", (cutoff_prune,))
+        xe(cur, "DELETE FROM rate_limits WHERE hit_ts < ?", (cutoff_prune,))
         minute_ago = now - 60.0
         day_ago = now - (24 * 3600)
         per_min_cap = 60 if is_pro else 10
 
-        cur.execute(
+        xe(
+            cur,
             "SELECT COUNT(*) FROM rate_limits WHERE session_id = ? AND hit_ts > ?",
             (sid, minute_ago),
         )
@@ -428,7 +240,8 @@ def enforce_ensemble_rate_limit(session_id: str, is_pro: bool) -> None:
             raise HTTPException(status_code=429, detail=ENSEMBLE_RATE_LIMIT_MSG)
 
         if not is_pro:
-            cur.execute(
+            xe(
+                cur,
                 "SELECT COUNT(*) FROM rate_limits WHERE session_id = ? AND hit_ts > ?",
                 (sid, day_ago),
             )
@@ -436,7 +249,7 @@ def enforce_ensemble_rate_limit(session_id: str, is_pro: bool) -> None:
                 conn.rollback()
                 raise HTTPException(status_code=429, detail=ENSEMBLE_RATE_LIMIT_MSG)
 
-        cur.execute("INSERT INTO rate_limits (session_id, hit_ts) VALUES (?, ?)", (sid, now))
+        xe(cur, "INSERT INTO rate_limits (session_id, hit_ts) VALUES (?, ?)", (sid, now))
         conn.commit()
     except HTTPException:
         raise
@@ -489,6 +302,245 @@ def routing_tier_label(token_saver_mode: str, web_search: bool) -> str:
     return "Standard"
 
 
+SYSTEM_INSTRUCTIONS_FILE = _BASE_DIR / "system_instructions.txt"
+
+BEN_SUPREME_JUDGE_SYSTEM_BASE = """
+Role: You are BEN, the Supreme Judge of an Ensemble Intelligence system. 
+Mission: Synthesize multiple AI sources into a single, verified response.
+
+STRICT LANGUAGE: Respond in English only. Every heading, bullet, label, quoted term, and body paragraph must be in English.
+
+JUDGMENT FRAMEWORK:
+1. Consensus: Prioritize facts agreed by all 3 models (High Confidence).
+2. Hierarchy: User Files > Cross-Model Consensus > Individual Insights.
+3. Conflict Management: Flag contradictions as "CONFLICT ALERT". Never guess.
+
+OUTPUT STRUCTURE:
+## TL;DR
+[One sentence concise answer]
+## Unified Answer
+[Merged response. Bold = consensus points]
+## Trust Map
+- ✅ High-confidence consensus across available models: [point]
+- ⚠️ Only one model said: [point]
+- ❌ CONFLICT: Model X says Y, Model Z says W
+## Delta Insights
+[Unique points each model contributed]
+## Next Action
+[Strictly under 10 words - Actionable button text]
+"""
+
+
+def _ben_auto_learned_suffix() -> str:
+    p = SYSTEM_INSTRUCTIONS_FILE
+    if not p.is_file():
+        return ""
+    try:
+        raw = p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    tail = raw[-8000:] if len(raw) > 8000 else raw
+    return (
+        "\n\n--- LEARNED INSTRUCTIONS (auto-updated when consensus is low) ---\n"
+        + tail
+        + "\n"
+    )
+
+
+def ben_supreme_judge_system_prompt() -> str:
+    return BEN_SUPREME_JUDGE_SYSTEM_BASE.strip() + _ben_auto_learned_suffix()
+
+
+def _truncate_audit_text(label: str, text: str, max_len: int) -> str:
+    s = (text or "").strip()
+    if len(s) <= max_len:
+        return f"{label}:\n{s}" if s else f"{label}:\n[empty]"
+    return f"{label}:\n{s[:max_len]} …[truncated]"
+
+
+def _parse_analyzer_json(raw: str) -> Optional[dict]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def _append_system_instructions_autolearn(blurb: str) -> None:
+    iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    chunk = f"\n\n### [{iso}] Consensus auto-learn (agreement below 50%)\n{blurb.strip()}\n"
+    SYSTEM_INSTRUCTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SYSTEM_INSTRUCTIONS_FILE, "a", encoding="utf-8") as fh:
+        fh.write(chunk)
+
+
+def _telemetry_self_heal_exists(telemetry_run_id: int) -> bool:
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        xe(c, "SELECT 1 FROM self_heals WHERE telemetry_run_id = ?", (telemetry_run_id,))
+        row = c.fetchone()
+        conn.close()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _insert_self_heal(
+    telemetry_run_id: int,
+    consensus_pct: float,
+    rationale: str,
+    instruction_addendum: str,
+) -> None:
+    conn = connect_db()
+    cu = conn.cursor()
+    row = (telemetry_run_id, consensus_pct, rationale[:1200], instruction_addendum[:2000])
+    if USE_POSTGRES:
+        xe(
+            cu,
+            """
+            INSERT INTO self_heals
+            (telemetry_run_id, consensus_pct, rationale, instruction_addendum)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (telemetry_run_id) DO NOTHING
+            """,
+            row,
+        )
+    else:
+        xe(
+            cu,
+            """
+            INSERT OR IGNORE INTO self_heals
+            (telemetry_run_id, consensus_pct, rationale, instruction_addendum)
+            VALUES (?, ?, ?, ?)
+            """,
+            row,
+        )
+    conn.commit()
+    conn.close()
+
+
+def _analyzer_model_key() -> str:
+    k = (os.getenv("ENSEMBLE_ANALYZER_MODEL") or "gpt-fast").strip()
+    return k if k else "gpt-fast"
+
+
+async def _run_consensus_analyzer_autofix(
+    *,
+    telemetry_run_id: int,
+    consensus_pct: float,
+    session_id: str,
+    question: str,
+    round1: dict,
+    round2: dict,
+    consensus_data: list,
+) -> None:
+    if consensus_pct >= 50.0 or telemetry_run_id <= 0:
+        return
+    if _telemetry_self_heal_exists(telemetry_run_id):
+        return
+    r1_preview = "\n".join(
+        [
+            _truncate_audit_text("gpt / MODEL A Round1", str(round1.get("gpt") or ""), 2200),
+            _truncate_audit_text("gemini / MODEL B Round1", str(round1.get("gemini") or ""), 2200),
+            _truncate_audit_text("claude / MODEL C Round1", str(round1.get("claude") or ""), 2200),
+        ]
+    )
+    r2_preview = "\n".join(
+        [
+            _truncate_audit_text("gpt Round2 critique", str(round2.get("gpt") or ""), 1800),
+            _truncate_audit_text("gemini Round2 critique", str(round2.get("gemini") or ""), 1800),
+            _truncate_audit_text("claude Round2 critique", str(round2.get("claude") or ""), 1800),
+        ]
+    )
+    cq = _truncate_audit_text("User question", question, 2000)
+    try:
+        consensus_blob = json.dumps(consensus_data, ensure_ascii=False)[:6500]
+    except TypeError:
+        consensus_blob = "[]"
+    prompt = f"""You are the Ensemble Analyzer (dedicated reviewer). Model agreement (consensus rate) was {consensus_pct:.1f}% (< 50%).
+
+Produce ONE actionable line of guidance the Supreme Judge should follow next time a similar disagreement appears.
+Do not quote secrets. Be specific about how to reconcile or rank conflicting claims.
+
+{cq}
+
+{r1_preview}
+
+{r2_preview}
+
+Consensus rows (may be abbreviated JSON):
+{consensus_blob}
+
+Reply with ONLY valid JSON:
+{{"instruction_addendum": "<=500 chars single line rule for BEN>", "rationale_one_line": "<=200 chars plain English>"}}
+"""
+    mk = _analyzer_model_key()
+    try:
+        raw = await ask_model_timed(mk, prompt, session_id or None, timeout_sec=90.0)
+    except Exception as ex:
+        print(f"[autofix] analyzer model call failed: {ex}")
+        return
+    if not raw or "Error:" in raw or _is_budget_error(raw):
+        print(f"[autofix] analyzer unusable response: {_ascii_preview(str(raw))}")
+        return
+    parsed = _parse_analyzer_json(raw)
+    if not isinstance(parsed, dict):
+        print("[autofix] analyzer JSON parse failed")
+        return
+    instr = str(parsed.get("instruction_addendum") or "").strip().replace("\n", " ")
+    rationale = str(parsed.get("rationale_one_line") or "").strip().replace("\n", " ")
+    if len(instr) < 12:
+        print("[autofix] analyzer returned empty instruction")
+        return
+    instr = instr[:500]
+    rationale = rationale[:200] if rationale else "Auto-learn applied from conflicting model outputs."
+    _append_system_instructions_autolearn(instr)
+    _insert_self_heal(telemetry_run_id, consensus_pct, rationale, instr)
+    print(f"[autofix] telemetry#{telemetry_run_id} learned instruction ({len(instr)} chars)")
+
+
+def _schedule_consensus_analyzer_if_needed(
+    pct: float,
+    telemetry_run_id: int,
+    *,
+    session_id: str,
+    question: str,
+    round1: dict,
+    round2: dict,
+    consensus_data,
+) -> None:
+    if pct >= 50.0 or telemetry_run_id <= 0:
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    cd = consensus_data if isinstance(consensus_data, list) else []
+    asyncio.create_task(
+        _run_consensus_analyzer_autofix(
+            telemetry_run_id=telemetry_run_id,
+            consensus_pct=float(pct),
+            session_id=session_id or "",
+            question=str(question or ""),
+            round1=round1 if isinstance(round1, dict) else {},
+            round2=round2 if isinstance(round2, dict) else {},
+            consensus_data=cd,
+        )
+    )
+
+
 def parallel_eff_ratio(lat_ms: dict, parallel_wall_ms: float) -> float:
     vals = [float(v) for v in lat_ms.values() if isinstance(v, (int, float)) and float(v) > 0]
     if not vals or parallel_wall_ms <= 0:
@@ -516,8 +568,8 @@ def record_telemetry_run(
     routing_tier: str,
     *,
     perf: Optional[dict] = None,
-) -> None:
-    """Persist ensemble run telemetry (Founder dashboards + Workspace v2 performance)."""
+) -> Optional[tuple[float, int]]:
+    """Persist ensemble run telemetry. Returns ``(consensus_pct, telemetry_row_id)`` on success."""
     perf = perf or {}
     try:
         pct = consensus_agreement_pct(consensus_data)
@@ -540,9 +592,9 @@ def record_telemetry_run(
         ftok = perf.get("first_token_ms")
         qlen = perf.get("question_len")
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         cu = conn.cursor()
-        cu.execute(
+        ins = (
             """
             INSERT INTO telemetry_runs (
                 created_at, consensus_pct, cost_usd, baseline_cost_usd, savings_usd, mode,
@@ -551,39 +603,49 @@ def record_telemetry_run(
                 parallel_efficiency_pct, routing_tier, streaming_active, fast_first_active,
                 first_token_ms, question_len
             ) VALUES (
-                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
-            """,
-            (
-                pct,
-                cost_usd,
-                baseline_usd,
-                savings_usd,
-                mode,
-                openai_usd,
-                gemini_usd,
-                anthropic_usd,
-                ensemble_wall_ms,
-                r1_wall_ms,
-                r1g,
-                r1gem,
-                r1cl,
-                parallel_pct,
-                routing_tier,
-                stream_act,
-                fast_first,
-                ftok,
-                qlen,
-            ),
+            """
+            + now_expr_insert()
+            + """, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
         )
+        if USE_POSTGRES:
+            ins += " RETURNING id"
+        params = (
+            pct,
+            cost_usd,
+            baseline_usd,
+            savings_usd,
+            mode,
+            openai_usd,
+            gemini_usd,
+            anthropic_usd,
+            ensemble_wall_ms,
+            r1_wall_ms,
+            r1g,
+            r1gem,
+            r1cl,
+            parallel_pct,
+            routing_tier,
+            stream_act,
+            fast_first,
+            ftok,
+            qlen,
+        )
+        cu.execute(sqlq(ins), params)
+        if USE_POSTGRES:
+            rid = int((cu.fetchone() or (0,))[0])
+        else:
+            rid = int(cu.lastrowid or 0)
         conn.commit()
         conn.close()
+        return (float(pct), rid)
     except Exception as ex:
         print(f"[telemetry] record failed: {ex}")
+        return None
 
 
-init_db()
-migrate_schema()
+init_db_tables()
+migrate_db_schema()
 
 # Sentinel: omit param to preserve DB value when calling save_profile
 _PROFILE_KEEP = object()
@@ -655,15 +717,21 @@ class FeedbackRequest(BaseModel):
     feedback_value: int
     category: str
 
+
+def xe(cur: Any, sql: str, params: tuple | list = ()) -> Any:
+    """Run SQL using ``?`` placeholders; adapted to ``%s`` on PostgreSQL."""
+    return cur.execute(sqlq(sql), params)
+
+
 # ========================
 # DATABASE HELPERS
 # ========================
 
 def get_conversation_history(session_id):
     """Retrieve conversation history from database"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute("""
+    xe(c, """
         SELECT role, content FROM messages 
         WHERE session_id = ? 
         ORDER BY timestamp ASC
@@ -683,9 +751,10 @@ def save_profile(
     active_tools=_PROFILE_KEEP,
 ):
     """Save or update a user's profile. Use sentinel _PROFILE_KEEP to leave blobs/tools unchanged."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute(
+    xe(
+        c,
         """
         SELECT user_name, user_role, projects, preferences, memory_context, uploaded_text,
                COALESCE(active_tools, ?)
@@ -720,7 +789,7 @@ def save_profile(
             lst = normalize_active_tools_list(active_tools if isinstance(active_tools, list) else [])
             tools_use = json.dumps(lst)
 
-        c.execute("""
+        xe(c, """
             UPDATE profiles
             SET user_name = ?, user_role = ?, projects = ?, preferences = ?, memory_context = ?,
                 uploaded_text = ?, active_tools = ?, updated_at = ?
@@ -743,7 +812,7 @@ def save_profile(
         else:
             tools_ins = json.dumps(normalize_active_tools_list(active_tools if isinstance(active_tools, list) else []))
 
-        c.execute("""
+        xe(c, """
             INSERT INTO profiles (
                 session_id, user_name, user_role, projects, preferences, memory_context,
                 uploaded_text, active_tools, updated_at)
@@ -766,9 +835,10 @@ def save_profile(
 
 def get_profile(session_id):
     """Retrieve stored user profile/memory from database."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute(
+    xe(
+        c,
         """
         SELECT user_name, user_role, projects, preferences, memory_context, uploaded_text,
                COALESCE(active_tools, ?)
@@ -829,9 +899,9 @@ def get_uploaded_prompt_injection(session_id):
 
 async def persist_session_upload(session_id: str, file: UploadFile) -> dict:
     """Read file, extract text (PyPDF2 for PDF), merge into profile uploaded_text + memory note."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute("SELECT session_id FROM sessions WHERE session_id = ?", (session_id,))
+    xe(c, "SELECT session_id FROM sessions WHERE session_id = ?", (session_id,))
     if not c.fetchone():
         conn.close()
         return {"success": False, "error": "Session not found"}
@@ -906,10 +976,10 @@ def build_profile_context(session_id):
 
 def save_message(session_id, model, role, content):
     """Save a message to database"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     timestamp = datetime.now().isoformat()
-    c.execute("""
+    xe(c, """
         INSERT INTO messages (session_id, model, role, content, timestamp)
         VALUES (?, ?, ?, ?, ?)
     """, (session_id, model, role, content, timestamp))
@@ -918,10 +988,10 @@ def save_message(session_id, model, role, content):
 
 def create_session(session_id, title):
     """Create a new conversation session"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     now = datetime.now().isoformat()
-    c.execute("""
+    xe(c, """
         INSERT INTO sessions (session_id, created_at, updated_at, title)
         VALUES (?, ?, ?, ?)
     """, (session_id, now, now, title))
@@ -930,9 +1000,9 @@ def create_session(session_id, title):
 
 def update_session_timestamp(session_id):
     """Update session's last update time"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute("""
+    xe(c, """
         UPDATE sessions SET updated_at = ? WHERE session_id = ?
     """, (datetime.now().isoformat(), session_id))
     conn.commit()
@@ -1837,36 +1907,15 @@ STRICT INSTRUCTION: Respond in English only.
 {bench}
 """
 
-    ben_system_prompt = """
-Role: You are BEN, the Supreme Judge of an Ensemble Intelligence system. 
-Mission: Synthesize multiple AI sources into a single, verified response.
-
-STRICT LANGUAGE: Respond in English only. Every heading, bullet, label, quoted term, and body paragraph must be in English.
-
-JUDGMENT FRAMEWORK:
-1. Consensus: Prioritize facts agreed by all 3 models (High Confidence).
-2. Hierarchy: User Files > Cross-Model Consensus > Individual Insights.
-3. Conflict Management: Flag contradictions as "CONFLICT ALERT". Never guess.
-
-OUTPUT STRUCTURE:
-## TL;DR
-[One sentence concise answer]
-## Unified Answer
-[Merged response. Bold = consensus points]
-## Trust Map
-- ✅ High-confidence consensus across available models: [point]
-- ⚠️ Only one model said: [point]
-- ❌ CONFLICT: Model X says Y, Model Z says W
-## Delta Insights
-[Unique points each model contributed]
-## Next Action
-[Strictly under 10 words - Actionable button text]
-"""
+    ben_system_prompt = ben_supreme_judge_system_prompt()
+    learned_user = _ben_auto_learned_suffix()
     if claude_client is None:
         if openai_client is not None:
             try:
                 return await ask_gpt(
-                    context_for_ben + "\n\nFollow the OUTPUT STRUCTURE from the system role.",
+                    context_for_ben
+                    + learned_user
+                    + "\n\nFollow the OUTPUT STRUCTURE from the system role.",
                     session_id=session_id,
                     model=OPENAI_DEFAULT_MODEL,
                 )
@@ -1879,7 +1928,9 @@ OUTPUT STRUCTURE:
         if openai_client is not None:
             try:
                 return await ask_gpt(
-                    context_for_ben + "\n\nFollow OUTPUT STRUCTURE: TL;DR, Unified Answer, Trust Map, Next Action.",
+                    context_for_ben
+                    + learned_user
+                    + "\n\nFollow OUTPUT STRUCTURE: TL;DR, Unified Answer, Trust Map, Next Action.",
                     session_id=session_id,
                     model=OPENAI_DEFAULT_MODEL,
                 )
@@ -1909,16 +1960,16 @@ STRICT INSTRUCTION: Respond in English only.
 {bench}
 """
     
-    ben_system_prompt = (
-        "Role: You are BEN, the Supreme Judge. Synthesize the provided inputs. "
-        "Strict instruction: Respond in English only—all output must be in English."
-    )
+    ben_system_prompt = ben_supreme_judge_system_prompt()
 
+    learned_user = _ben_auto_learned_suffix()
     if claude_client is None:
         if openai_client is not None:
             try:
                 text = await ask_gpt(
-                    context_for_ben + "\n\nFollow the synthesis structure (TL;DR, headings, English).",
+                    context_for_ben
+                    + learned_user
+                    + "\n\nFollow the synthesis structure (TL;DR, headings, English).",
                     session_id=session_id,
                     model=OPENAI_DEFAULT_MODEL,
                 )
@@ -1942,7 +1993,9 @@ STRICT INSTRUCTION: Respond in English only.
         if openai_client is not None:
             try:
                 text = await ask_gpt(
-                    context_for_ben + "\n\nSame structure: TL;DR, Unified Answer, Trust Map, Next Action.",
+                    context_for_ben
+                    + learned_user
+                    + "\n\nSame structure: TL;DR, Unified Answer, Trust Map, Next Action.",
                     session_id=session_id,
                     model=OPENAI_DEFAULT_MODEL,
                 )
@@ -1964,21 +2017,27 @@ STRICT INSTRUCTION: Respond in English only.
 def auth_register(body: AuthRegisterBody):
     email = normalize_account_email(body.email)
     pw = bcrypt.hashpw(body.password.encode("utf-8"), bcrypt.gensalt()).decode("ascii")
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     try:
-        c.execute(
-            """
+        ins = """
             INSERT INTO users (email, password_hash)
             VALUES (?, ?)
-            """,
-            (email, pw),
-        )
+            """
+        if USE_POSTGRES:
+            ins += " RETURNING id"
+        xe(c, ins, (email, pw))
         conn.commit()
-        user_id = c.lastrowid
-    except sqlite3.IntegrityError:
+        if USE_POSTGRES:
+            user_id = int(c.fetchone()[0])
+        else:
+            user_id = int(c.lastrowid)
+    except Exception as ex:
+        conn.rollback()
         conn.close()
-        raise HTTPException(status_code=400, detail="Email already registered")
+        if is_unique_violation(ex):
+            raise HTTPException(status_code=400, detail="Email already registered") from ex
+        raise
     conn.close()
 
     tok = create_access_token(int(user_id))
@@ -1988,9 +2047,9 @@ def auth_register(body: AuthRegisterBody):
 @app.post("/auth/login")
 def auth_login(body: AuthLoginBody):
     email = normalize_account_email(body.email)
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute("SELECT id, password_hash FROM users WHERE email = ?", (email,))
+    xe(c, "SELECT id, password_hash FROM users WHERE email = ?", (email,))
     row = c.fetchone()
     conn.close()
     if row is None or not bcrypt.checkpw(
@@ -2032,11 +2091,11 @@ def create_new_session(req: NewSessionRequest):
 @app.get("/session/{session_id}")
 def get_session_history(session_id: str):
     """Retrieve full conversation history for a session"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     
     # Get session info
-    c.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
+    xe(c, "SELECT * FROM sessions WHERE session_id = ?", (session_id,))
     session = c.fetchone()
     
     if not session:
@@ -2044,7 +2103,7 @@ def get_session_history(session_id: str):
         return {"success": False, "error": "Session not found"}
     
     # Get all messages
-    c.execute("""
+    xe(c, """
         SELECT model, role, content, timestamp FROM messages 
         WHERE session_id = ? 
         ORDER BY timestamp ASC
@@ -2053,7 +2112,7 @@ def get_session_history(session_id: str):
     prof = get_profile(session_id)
     # Get trial count
     user_id = prof.get("user_name", "anonymous") if prof else "anonymous"
-    c.execute("SELECT trial_count FROM trial_usage WHERE user_identifier = ?", (user_id,))
+    xe(c, "SELECT trial_count FROM trial_usage WHERE user_identifier = ?", (user_id,))
     t_row = c.fetchone()
     trial_count = t_row[0] if t_row else 0
     conn.close()
@@ -2080,9 +2139,9 @@ def get_session_history(session_id: str):
 @app.post("/session/{session_id}/profile")
 def update_session_profile(session_id: str, req: ProfileRequest):
     """Update or create profile/memory data for a session"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute("SELECT session_id FROM sessions WHERE session_id = ?", (session_id,))
+    xe(c, "SELECT session_id FROM sessions WHERE session_id = ?", (session_id,))
     if not c.fetchone():
         conn.close()
         return {"success": False, "error": "Session not found"}
@@ -2103,9 +2162,9 @@ def update_session_profile(session_id: str, req: ProfileRequest):
 @app.patch("/session/{session_id}/active-tools")
 def patch_session_active_tools(session_id: str, body: ActiveToolsRequest):
     """BEN Workspace: persist which GPT/Gemini/Claude lanes are routed for this session."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute("SELECT session_id FROM sessions WHERE session_id = ?", (session_id,))
+    xe(c, "SELECT session_id FROM sessions WHERE session_id = ?", (session_id,))
     if not c.fetchone():
         conn.close()
         return {"success": False, "error": "Session not found"}
@@ -2118,9 +2177,9 @@ def patch_session_active_tools(session_id: str, body: ActiveToolsRequest):
 @app.get("/sessions")
 def list_sessions():
     """List all conversation sessions"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
-    c.execute("SELECT session_id, title, created_at, updated_at FROM sessions ORDER BY updated_at DESC")
+    xe(c, "SELECT session_id, title, created_at, updated_at FROM sessions ORDER BY updated_at DESC")
     sessions = c.fetchall()
     conn.close()
     
@@ -2146,9 +2205,9 @@ async def ask_single_model(req: AskRequest):
     """Ask a question to a single model with conversation context"""
     try:
         # Verify session exists
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         c = conn.cursor()
-        c.execute("SELECT session_id FROM sessions WHERE session_id = ?", (req.session_id,))
+        xe(c, "SELECT session_id FROM sessions WHERE session_id = ?", (req.session_id,))
         if not c.fetchone():
             conn.close()
             return {"success": False, "error": "Session not found"}
@@ -2189,9 +2248,9 @@ async def ask_single_model(req: AskRequest):
 def submit_feedback(req: FeedbackRequest):
     """Store user feedback for the learning engine"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         c = conn.cursor()
-        c.execute("""
+        xe(c, """
             INSERT INTO learning_feedback (category, model, feedback_value, timestamp)
             VALUES (?, ?, ?, ?)
         """, (req.category, req.model, req.feedback_value, datetime.now().isoformat()))
@@ -2254,35 +2313,32 @@ async def research_examples(req: AskRequest):
 async def run_ensemble(req: RunRequest, _uid: int = Depends(require_login)):
     """Run the 3-round ensemble analysis with multi-turn capability"""
     try:
-        # Verify session exists
-        conn = sqlite3.connect(DB_PATH)
+        # Verify session exists + trial usage (single connection)
+        conn = connect_db()
         c = conn.cursor()
-        c.execute("SELECT session_id FROM sessions WHERE session_id = ?", (req.session_id,))
+        xe(c, "SELECT session_id FROM sessions WHERE session_id = ?", (req.session_id,))
         if not c.fetchone():
             conn.close()
             return {"success": False, "error": "Session not found"}
-        
-        # Check Trial Usage
+
         profile = get_profile(req.session_id)
         user_id = profile.get("user_name", "anonymous") if profile else "anonymous"
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT trial_count, is_pro FROM trial_usage WHERE user_identifier = ?", (user_id,))
+
+        xe(c, "SELECT trial_count, is_pro FROM trial_usage WHERE user_identifier = ?", (user_id,))
         row = c.fetchone()
-        
+
         trial_count = 0
         is_pro = 0
         if row:
             trial_count, is_pro = row
         else:
-            c.execute("INSERT INTO trial_usage (user_identifier, trial_count) VALUES (?, 0)", (user_id,))
+            xe(c, "INSERT INTO trial_usage (user_identifier, trial_count) VALUES (?, 0)", (user_id,))
             conn.commit()
-            
+
         if not is_pro and trial_count >= 3 and not DEV_MODE:
             conn.close()
             return {
-                "success": False, 
+                "success": False,
                 "error": "Trial Exceeded",
                 "trial_exceeded": True,
                 "trial_count": trial_count
@@ -2292,9 +2348,9 @@ async def run_ensemble(req: RunRequest, _uid: int = Depends(require_login)):
 
         # Save user question
         save_message(req.session_id, "ensemble", "user", req.question)
-        
+
         # Increment trial count
-        c.execute("UPDATE trial_usage SET trial_count = trial_count + 1 WHERE user_identifier = ?", (user_id,))
+        xe(c, "UPDATE trial_usage SET trial_count = trial_count + 1 WHERE user_identifier = ?", (user_id,))
         conn.commit()
         conn.close()
         
@@ -2309,9 +2365,9 @@ Question: {req.question}
             category = "technical"
             
         # Fetch historical stats
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         c = conn.cursor()
-        c.execute("""
+        xe(c, """
             SELECT model, SUM(feedback_value) as score, COUNT(*) as total
             FROM learning_feedback
             WHERE category = ?
@@ -2589,13 +2645,24 @@ Find contradictions, shallow thinking, hidden assumptions, strategic weaknesses,
         save_message(req.session_id, "ensemble-final", "assistant", final)
         session_cost = _calculate_session_cost(round1, round2, final, token_saver_mode)
         cd = consensus_data if isinstance(consensus_data, list) else []
-        record_telemetry_run(
+        tel = record_telemetry_run(
             cd,
             session_cost,
             token_saver_mode,
             routing_tier_label(token_saver_mode, bool(req.web_search)),
             perf={},
         )
+        if tel:
+            p_tel, tid = tel
+            _schedule_consensus_analyzer_if_needed(
+                p_tel,
+                tid,
+                session_id=req.session_id,
+                question=str(req.question or ""),
+                round1=round1,
+                round2=round2,
+                consensus_data=cd,
+            )
 
         # Update session timestamp
         update_session_timestamp(req.session_id)
@@ -2713,16 +2780,16 @@ async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login
 
     profile = get_profile(req.session_id)
     user_id = profile.get("user_name", "anonymous") if profile else "anonymous"
-    conn_pre = sqlite3.connect(DB_PATH)
+    conn_pre = connect_db()
     c_pre = conn_pre.cursor()
-    c_pre.execute("SELECT trial_count, is_pro FROM trial_usage WHERE user_identifier = ?", (user_id,))
+    xe(c_pre, "SELECT trial_count, is_pro FROM trial_usage WHERE user_identifier = ?", (user_id,))
     row_pre = c_pre.fetchone()
     trial_count_pre = 0
     is_pro_pre = 0
     if row_pre:
         trial_count_pre, is_pro_pre = int(row_pre[0]), int(row_pre[1] or 0)
     else:
-        c_pre.execute("INSERT INTO trial_usage (user_identifier, trial_count) VALUES (?, 0)", (user_id,))
+        xe(c_pre, "INSERT INTO trial_usage (user_identifier, trial_count) VALUES (?, 0)", (user_id,))
         conn_pre.commit()
     conn_pre.close()
 
@@ -2747,10 +2814,12 @@ async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login
             # SSE framing: one JSON event per data line
             return f"data: {json.dumps(payload)}\n\n"
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = connect_db()
             c = conn.cursor()
-            c.execute(
-                "UPDATE trial_usage SET trial_count = trial_count + 1 WHERE user_identifier = ?", (user_id,)
+            xe(
+                c,
+                "UPDATE trial_usage SET trial_count = trial_count + 1 WHERE user_identifier = ?",
+                (user_id,),
             )
             conn.commit()
             conn.close()
@@ -3121,13 +3190,24 @@ async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login
                 "first_token_ms": leader_info.get("first_ms"),
                 "question_len": len(req.question or ""),
             }
-            record_telemetry_run(
+            tel = record_telemetry_run(
                 consensus_data,
                 session_cost,
                 token_saver_mode,
                 routing_tier_label(token_saver_mode, bool(req.web_search)),
                 perf=perf_snapshot,
             )
+            if tel:
+                p_tel, tid = tel
+                _schedule_consensus_analyzer_if_needed(
+                    p_tel,
+                    tid,
+                    session_id=req.session_id,
+                    question=str(req.question or ""),
+                    round1=round1,
+                    round2=round2,
+                    consensus_data=consensus_data,
+                )
 
             yield emit(
                 {
@@ -3171,7 +3251,7 @@ try:
     register_founders_routes(
         app,
         base_dir=_BASE_DIR,
-        db_path=DB_PATH,
+        db_connect=connect_db,
         model_registry=MODEL_REGISTRY,
         run_credit_probe=run_credit_probe,
     )
@@ -3185,6 +3265,6 @@ except ImportError as _fe:
 
 
 if __name__ == "__main__":
-    _port = int(os.getenv("ENSEMBLE_PORT", "8080"))
+    _port = int(os.environ.get("PORT") or os.getenv("ENSEMBLE_PORT") or "8080")
     _reload_local = os.getenv("ENSEMBLE_RELOAD", "").strip().lower() in ("1", "true", "yes", "on")
     uvicorn.run("main:app", host="0.0.0.0", port=_port, reload=_reload_local)
