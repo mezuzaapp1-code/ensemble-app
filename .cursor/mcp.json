@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ensemble-codebase": {
+      "command": "python",
+      "args": ["mcp_codebase.py"]
+    }
+  }
+}

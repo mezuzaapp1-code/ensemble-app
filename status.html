@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Founder’s Control — Status</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    :root {
+      --bg: #0c0d10;
+      --card: #15171c;
+      --border: #252830;
+      --text: #e8e9ec;
+      --muted: #8b909a;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+      --accent: #6366f1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: Inter, system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+      min-height: 100vh; line-height: 1.5;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 80px; }
+    h1 { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 6px; }
+    .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 28px; }
+    .grid { display: grid; gap: 18px; }
+    @media (min-width: 720px) {
+      .grid-2 { grid-template-columns: 1fr 1fr; }
+    }
+    section {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; padding: 18px 20px;
+    }
+    section h2 {
+      margin: 0 0 14px; font-size: 0.75rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted);
+    }
+    .dot {
+      width: 14px; height: 14px; border-radius: 50%;
+      display: inline-block; margin-right: 10px; vertical-align: middle;
+      box-shadow: 0 0 12px currentColor;
+    }
+    .dot.ok { background: var(--green); color: var(--green); }
+    .dot.bad { background: var(--red); color: var(--red); }
+    .row { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+    .prov { flex: 1; min-width: 200px; }
+    .prov-name { font-weight: 600; margin-bottom: 4px; }
+    .models { font-size: 0.85rem; color: var(--muted); word-break: break-all; }
+    .truth-num { font-size: 2.25rem; font-weight: 700; letter-spacing: -0.03em; color: var(--accent); }
+    .truth-msg { margin-top: 10px; font-size: 0.95rem; }
+    .cfo-row { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 0.92rem; }
+    .cfo-row span { color: var(--muted); }
+    .runway { font-weight: 700; }
+    .runway.ok { color: var(--green); }
+    .runway.yellow { color: var(--yellow); }
+    .runway.red { color: var(--red); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 10px; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    .auditor ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 0.9rem; }
+    .auditor li { margin-bottom: 6px; }
+    .err { font-size: 0.88rem; padding: 10px 12px; background: rgba(239,68,68,0.08); border-radius: 8px; margin-bottom: 8px; border: 1px solid rgba(239,68,68,0.25); }
+    .err .friendly { font-weight: 600; color: var(--text); }
+    .err .raw { font-size: 0.78rem; color: var(--muted); margin-top: 4px; word-break: break-all; }
+    .perf-muted { font-size: 0.82rem; color: var(--muted); margin-bottom: 14px; }
+    .perf-row { margin-bottom: 12px; }
+    .perf-label { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 0.85rem; margin-bottom: 4px; flex-wrap: wrap; }
+    .perf-label strong { color: var(--text); font-weight: 600; }
+    .perf-label span:last-child { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 0.8rem; }
+    .perf-track { height: 8px; border-radius: 999px; background: #252830; overflow: hidden; border: 1px solid var(--border); }
+    .perf-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #6366f1, #22c55e); width: 0%; transition: width 0.35s ease; }
+    .perf-kv { display: grid; gap: 6px; font-size: 0.88rem; margin-top: 12px; }
+    .perf-kv div { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .perf-kv span { color: var(--muted); }
+    .perf-kv strong { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+    .btns { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+    button {
+      font-family: inherit; font-size: 0.88rem; font-weight: 600;
+      padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border);
+      background: #1e2028; color: var(--text); cursor: pointer;
+    }
+    button:hover { background: #262930; border-color: #363b48; }
+    button.danger { border-color: rgba(239,68,68,0.45); color: #fca5a5; }
+    button.danger:hover { background: rgba(239,68,68,0.12); }
+    .tick { font-size: 0.8rem; color: var(--muted); margin-top: 16px; }
+    a.home { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
+    a.home:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <a class="home" href="/">← Back to chat</a>
+    <h1>Founder’s Control</h1>
+    <p class="sub">Health, spend, agreement signals, and change history. Updates every 60 seconds.</p>
+
+    <div class="grid">
+      <section>
+        <h2>System health</h2>
+        <div id="healthMount"></div>
+      </section>
+
+      <section>
+        <h2>Truth meter (consensus)</h2>
+        <div class="truth-num" id="truthPct">—</div>
+        <div class="truth-msg" id="truthMsg">Loading…</div>
+      </section>
+
+      <section class="grid-2" style="display:grid;">
+        <div>
+          <h2>Money & runway</h2>
+          <div id="cfoMount"></div>
+        </div>
+        <div>
+          <h2>Token saver savings</h2>
+          <div id="savingsMount" style="font-size:0.92rem;color:var(--muted);">…</div>
+        </div>
+      </section>
+
+      <section class="auditor">
+        <h2>Change log (vs last commit)</h2>
+        <ul id="auditorList"><li>Loading…</li></ul>
+      </section>
+
+      <section>
+        <h2>Recent issues (last 3)</h2>
+        <div id="errMount"></div>
+      </section>
+
+      <section>
+        <h2>Safety</h2>
+        <p style="color:var(--muted);font-size:0.9rem;margin:0 0 8px;">Save a zip of the project, or restore the latest backup and restart the server.</p>
+        <div class="btns">
+          <button type="button" id="btnBackup">Save backup zip</button>
+          <button type="button" class="danger" id="btnRestore">Restore last working version</button>
+        </div>
+        <p class="tick" id="actionMsg"></p>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    function el(tag, attrs, children) {
+      const n = document.createElement(tag);
+      if (attrs) Object.entries(attrs).forEach(([k,v]) => {
+        if (k === "class") n.className = v;
+        else if (k === "html") n.innerHTML = v;
+        else n.setAttribute(k, v);
+      });
+      (children || []).forEach(c => n.appendChild(c));
+      return n;
+    }
+
+    function renderHealth(data) {
+      const h = data.health || {};
+      const ms = data.model_strings || {};
+      const mount = document.getElementById("healthMount");
+      mount.innerHTML = "";
+      ["openai", "gemini", "anthropic"].forEach(key => {
+        const meta = h[key] || {};
+        const ok = !!meta.ready;
+        const label = key === "openai" ? "OpenAI" : key === "gemini" ? "Gemini" : "Anthropic";
+        const dots = el("span", { class: "dot " + (ok ? "ok" : "bad") });
+        const models = (ms[key] || []).join(", ") || "—";
+        mount.appendChild(el("div", { class: "row" }, [
+          el("div", { class: "prov" }, [
+            el("div", { class: "prov-name" }, [dots, document.createTextNode(label + " — " + (meta.status || ""))]),
+            el("div", { class: "models" }, [document.createTextNode(models)])
+          ])
+        ]));
+      });
+    }
+
+    function renderCfo(cfo) {
+      const m = document.getElementById("cfoMount");
+      if (!cfo) { m.textContent = "No data yet."; return; }
+      const rl = cfo.runway_level || "ok";
+      const rd = cfo.runway_days;
+      const runwayClass = "runway " + rl;
+      const runwayTxt = rd != null ? rd + " days" : "— (add spend data & FOUNDER_API_BUDGET_USD)";
+      const budgetNote = "Founder budget uses env <code style=color:var(--accent)>FOUNDER_API_BUDGET_USD</code>";
+      m.innerHTML = `
+        <div class="cfo-row"><span>Today spend (total)</span><strong>$${(cfo.today_total_usd || 0).toFixed(4)}</strong></div>
+        <div class="cfo-row"><span>Avg daily burn (7d)</span><strong>$${(cfo.avg_daily_burn_usd || 0).toFixed(4)}</strong></div>
+        <div class="cfo-row"><span>Runway</span><span class="${runwayClass}">${runwayTxt}</span></div>
+        <div class="cfo-row"><span>Budget set</span><strong>$${(cfo.budget_usd || 0).toFixed(2)}</strong></div>
+        <p style="font-size:0.8rem;color:var(--muted);margin-top:12px;">${budgetNote}</p>
+      `;
+
+      const daily = cfo.daily_series || [];
+      if (daily.length) {
+        const tbl = el("table", {});
+        tbl.appendChild(el("tr", {}, [
+          el("th", {}, [document.createTextNode("Date")]),
+          el("th", {}, [document.createTextNode("OpenAI")]),
+          el("th", {}, [document.createTextNode("Gemini")]),
+          el("th", {}, [document.createTextNode("Anthropic")]),
+          el("th", {}, [document.createTextNode("Day total")]),
+        ]));
+        daily.slice(0, 10).forEach(d => {
+          tbl.appendChild(el("tr", {}, [
+            el("td", {}, [document.createTextNode(d.date)]),
+            el("td", {}, [document.createTextNode("$" + (d.openai_usd || 0).toFixed(4))]),
+            el("td", {}, [document.createTextNode("$" + (d.gemini_usd || 0).toFixed(4))]),
+            el("td", {}, [document.createTextNode("$" + (d.anthropic_usd || 0).toFixed(4))]),
+            el("td", {}, [document.createTextNode("$" + (d.total_usd || 0).toFixed(4))]),
+          ]));
+        });
+        m.appendChild(tbl);
+      }
+
+      document.getElementById("savingsMount").innerHTML =
+        `Would have spent (baseline): <strong style=color:var(--text)>$${(cfo.would_have_spent_usd || 0).toFixed(4)}</strong><br/>` +
+        `Actually spent: <strong style=color:var(--text)>$${(cfo.actually_spent_usd || 0).toFixed(4)}</strong><br/>` +
+        `Token saver savings: <strong style=color:var(--green)>$${(cfo.token_saver_savings_usd || 0).toFixed(4)}</strong>`;
+    }
+
+    function renderAuditor(items) {
+      const ul = document.getElementById("auditorList");
+      ul.innerHTML = "";
+      if (!items || !items.length) {
+        ul.appendChild(el("li", {}, [document.createTextNode("No uncommitted file changes vs last commit.")]));
+        return;
+      }
+      items.forEach(x => {
+        ul.appendChild(el("li", {}, [document.createTextNode(x.summary + " (" + x.file + ")")]));
+      });
+    }
+
+    function fmtMs(v) {
+      if (v == null || !Number.isFinite(Number(v))) return "—";
+      return Math.round(Number(v)) + " ms";
+    }
+
+    function pctBarPct(avgMs, scaleMs) {
+      if (avgMs == null || !Number.isFinite(Number(avgMs))) return 0;
+      const sc = Number(scaleMs) > 0 ? Number(scaleMs) : 1;
+      return Math.min(100, (Number(avgMs) / sc) * 100);
+    }
+
+    function perfBarRow(label, avgMs, scaleMs, barClass) {
+      const pct = pctBarPct(avgMs, scaleMs);
+      const row = el("div", { class: "perf-row" });
+      row.appendChild(el("div", { class: "perf-label", html:
+        `<strong>${label}</strong><span>${fmtMs(avgMs)} avg</span>` }));
+      const tr = el("div", { class: "perf-track" });
+      const fill = el("div", { class: "perf-fill " + (barClass || "") });
+      fill.style.width = pct + "%";
+      tr.appendChild(fill);
+      row.appendChild(tr);
+      return row;
+    }
+
+    function renderPerf(data) {
+      const mount = document.getElementById("perfMount");
+      if (!mount) return;
+      const p = data.performance || {};
+      mount.innerHTML = "";
+      mount.classList.remove("perf-muted");
+      if (!p.runs_today) {
+        mount.textContent = "No ensemble runs logged today.";
+        mount.classList.add("perf-muted");
+        return;
+      }
+      mount.appendChild(el("div", { class: "perf-muted", html:
+        `<span>${p.runs_today}</span> run(s) today (UTC calendar day on server). Bars scale to the longest average among the three.` }));
+
+      const av = p.avg_ms || {};
+      const scale = Number(p.bar_scale_ms) || 1;
+      mount.appendChild(perfBarRow("GPT · Analysis & math", av.gpt, scale, ""));
+      mount.appendChild(perfBarRow("Gemini · Search & files", av.gemini, scale, ""));
+      mount.appendChild(perfBarRow("Claude · Code & writing", av.claude, scale, ""));
+
+      const pe = p.parallel_efficiency_pct_avg;
+      const effRow = el("div", { class: "perf-row", style: "margin-top:16px;" });
+      effRow.appendChild(el("div", { class: "perf-label", html:
+        `<strong>Parallel efficiency</strong><span>${pe != null ? pe.toFixed(1) + "%" : "—"}</span>` }));
+      const trE = el("div", { class: "perf-track" });
+      const fiE = el("div", { class: "perf-fill" });
+      fiE.style.width = (pe == null ? 0 : Math.min(100, Math.max(0, pe))) + "%";
+      trE.appendChild(fiE);
+      effRow.appendChild(trE);
+      mount.appendChild(effRow);
+
+      const rp = p.routing_pct || {};
+      mount.appendChild(el("div", { class: "perf-label", style: "margin-top:16px;margin-bottom:6px;",
+        html: `<strong>Routing breakdown</strong><span>tier mix</span>` }));
+      ["Economy", "Standard", "Premium"].forEach(tier => {
+        const pct = rp[tier];
+        const rr = el("div", { class: "perf-row" });
+        rr.appendChild(el("div", { class: "perf-label", html:
+          `<strong>${tier}</strong><span>${pct == null ? "—" : pct.toFixed(1) + "%"}</span>` }));
+        const trR = el("div", { class: "perf-track" });
+        const fiR = el("div", { class: "perf-fill" });
+        fiR.style.width = (pct == null ? 0 : Math.min(100, pct)) + "%";
+        fiR.style.opacity = "0.85";
+        trR.appendChild(fiR);
+        rr.appendChild(trR);
+        mount.appendChild(rr);
+      });
+
+      const kv = el("div", { class: "perf-kv" });
+      kv.appendChild(el("div", { html: `<span>Streaming</span><strong>${p.streaming_status_label || "—"} (${p.streaming_active_pct != null ? p.streaming_active_pct.toFixed(1) + "%" : "—"} of runs)</strong>` }));
+      kv.appendChild(el("div", { html: `<span>Fast first answer (&lt;=2.1s)</span><strong>${p.fast_first_status_label || "—"} (${p.fast_first_pct != null ? p.fast_first_pct.toFixed(1) + "%" : "—"} of runs)</strong>` }));
+      kv.appendChild(el("div", { html: `<span>Slowest question (ensemble wall)</span><strong>${fmtMs(p.ensemble_wall_slowest_ms)}</strong>` }));
+      kv.appendChild(el("div", { html: `<span>Fastest question (ensemble wall)</span><strong>${fmtMs(p.ensemble_wall_fastest_ms)}</strong>` }));
+      mount.appendChild(kv);
+    }
+
+    function renderErr(list) {
+      const mount = document.getElementById("errMount");
+      mount.innerHTML = "";
+      if (!list || !list.length) {
+        mount.appendChild(el("div", { class: "err" }, [
+          el("div", { class: "friendly" }, [document.createTextNode("No recent errors recorded.")])
+        ]));
+        return;
+      }
+      list.forEach(e => {
+        const d = el("div", { class: "err" });
+        d.appendChild(el("div", { class: "friendly" }, [document.createTextNode(e.friendly)]));
+        d.appendChild(el("div", { class: "raw" }, [document.createTextNode((e.time || "") + " · " + (e.source || "") + " · " + (e.raw || ""))]));
+        mount.appendChild(d);
+      });
+    }
+
+    async function refresh() {
+      try {
+        const r = await fetch("/api/founder/dashboard", { cache: "no-store" });
+        const data = await r.json();
+        renderHealth(data);
+        document.getElementById("truthPct").textContent = (data.truth_consensus_pct != null ? data.truth_consensus_pct + "%" : "—");
+        document.getElementById("truthMsg").textContent = data.truth_message || "";
+        renderCfo(data.cfo);
+        renderPerf(data);
+        renderAuditor((data.auditor && data.auditor.uncommitted_files) || []);
+        renderErr(data.errors || []);
+      } catch (e) {
+        document.getElementById("truthMsg").textContent = "Could not load dashboard. Is the server running on this port?";
+        console.error(e);
+      }
+    }
+
+    document.getElementById("btnBackup").onclick = async () => {
+      const msg = document.getElementById("actionMsg");
+      msg.textContent = "Creating zip…";
+      try {
+        const r = await fetch("/api/founder/backup", { method: "POST" });
+        const j = await r.json();
+        msg.textContent = j.success ? ("Saved: " + j.path) : "Failed.";
+      } catch (e) {
+        msg.textContent = String(e);
+      }
+    };
+    document.getElementById("btnRestore").onclick = async () => {
+      if (!confirm("Restore the latest backup zip and restart the server? Unsaved work may be lost.")) return;
+      const msg = document.getElementById("actionMsg");
+      msg.textContent = "Restoring… connection may drop when the server restarts.";
+      try {
+        await fetch("/api/founder/restore", { method: "POST" });
+      } catch (e) {
+        msg.textContent = "If the server restarted, reload this page in a few seconds.";
+      }
+    };
+
+    refresh();
+    setInterval(refresh, 60000);
+  </script>
+</body>
+</html>
