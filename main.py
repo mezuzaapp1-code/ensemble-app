@@ -7,14 +7,17 @@ import subprocess
 import tempfile
 import time
 import io
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Optional
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException
+import bcrypt
+import jwt
+from fastapi import Depends, FastAPI, UploadFile, File, Form, Body, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import httpx
 from google import genai
 try:
@@ -204,6 +207,15 @@ def init_db():
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_session_hit ON rate_limits (session_id, hit_ts)")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
     
     conn.commit()
     conn.close()
@@ -274,8 +286,83 @@ def migrate_schema():
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_session_hit ON rate_limits (session_id, hit_ts)")
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+
+JWT_EXPIRATION_SECONDS = int(os.getenv("JWT_EXPIRATION_SECONDS", str(24 * 3600)))
+auth_scheme = HTTPBearer(auto_error=False)
+
+
+def _jwt_secret() -> str:
+    s = (os.getenv("JWT_SECRET") or "").strip()
+    if not s:
+        print(
+            "[auth] JWT_SECRET is not set — using insecure development default "
+            "(set JWT_SECRET for production)."
+        )
+        # HMAC SHA-256 JWT requires key length recommendation ≥ 32 octets (RFC 7518).
+        s = "ensemble-development-jwt-signing-secret-min-length-thirty-two"
+    return s
+
+
+def normalize_account_email(raw: str) -> str:
+    em = (raw or "").strip().lower()
+    if len(em) < 3:
+        raise HTTPException(status_code=422, detail="Invalid email")
+    if "@" not in em:
+        raise HTTPException(status_code=422, detail="Invalid email")
+    _, domain = em.rsplit("@", 1)
+    if "." not in domain:
+        raise HTTPException(status_code=422, detail="Invalid email")
+    return em
+
+
+def create_access_token(user_id: int) -> str:
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(seconds=JWT_EXPIRATION_SECONDS)
+    token = jwt.encode(
+        {"sub": str(user_id), "iat": now, "exp": exp},
+        _jwt_secret(),
+        algorithm="HS256",
+    )
+    return token if isinstance(token, str) else token.decode("utf-8")
+
+
+def require_login(
+    credentials: Annotated[
+        Optional[HTTPAuthorizationCredentials],
+        Depends(auth_scheme),
+    ],
+) -> int:
+    if credentials is None or not getattr(credentials, "credentials", None):
+        raise HTTPException(status_code=401, detail="Please login")
+    token = credentials.credentials.strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Please login")
+    try:
+        payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
+        uid = int(payload.get("sub"))
+    except (jwt.PyJWTError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Please login")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id FROM users WHERE id = ?", (uid,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="Please login")
+    return uid
 
 
 ENSEMBLE_RATE_LIMIT_MSG = (
@@ -524,6 +611,17 @@ class ProfileRequest(BaseModel):
 class ActiveToolsRequest(BaseModel):
     """Subset of ensemble analyst keys wired to GPT / Gemini / Claude."""
     active_tools: list[str]
+
+
+class AuthRegisterBody(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=8)
+
+
+class AuthLoginBody(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str
+
 
 class FeedbackRequest(BaseModel):
     session_id: str
@@ -1836,6 +1934,49 @@ STRICT INSTRUCTION: Respond in English only.
 # ========================
 
 
+@app.post("/auth/register")
+def auth_register(body: AuthRegisterBody):
+    email = normalize_account_email(body.email)
+    pw = bcrypt.hashpw(body.password.encode("utf-8"), bcrypt.gensalt()).decode("ascii")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute(
+            """
+            INSERT INTO users (email, password_hash)
+            VALUES (?, ?)
+            """,
+            (email, pw),
+        )
+        conn.commit()
+        user_id = c.lastrowid
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Email already registered")
+    conn.close()
+
+    tok = create_access_token(int(user_id))
+    return {"success": True, "access_token": tok, "token_type": "Bearer"}
+
+
+@app.post("/auth/login")
+def auth_login(body: AuthLoginBody):
+    email = normalize_account_email(body.email)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, password_hash FROM users WHERE email = ?", (email,))
+    row = c.fetchone()
+    conn.close()
+    if row is None or not bcrypt.checkpw(
+        body.password.encode("utf-8"),
+        str(row[1]).encode("utf-8"),
+    ):
+        raise HTTPException(status_code=401, detail="Please login")
+
+    tok = create_access_token(int(row[0]))
+    return {"access_token": tok, "token_type": "Bearer"}
+
+
 @app.get("/")
 async def serve_index():
     """Serve the main web UI."""
@@ -2084,7 +2225,7 @@ async def research_examples(req: AskRequest):
     return {"success": True, "examples": examples}
 
 @app.post("/ensemble/run")
-async def run_ensemble(req: RunRequest):
+async def run_ensemble(req: RunRequest, _uid: int = Depends(require_login)):
     """Run the 3-round ensemble analysis with multi-turn capability"""
     try:
         # Verify session exists
@@ -2541,7 +2682,7 @@ async def tools_similar_ai(req: SimilarAIToolsRequest):
 
 
 @app.post("/ensemble/stream")
-async def run_ensemble_stream(req: RunRequest):
+async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login)):
     """NDJSON stream: parallel Round 1 token streams, provisional BEN drafts, then consensus + R2 + final BEN."""
 
     profile = get_profile(req.session_id)

@@ -551,7 +551,11 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
       <h1 class="session-title" id="sessionTitle">AI Ensemble</h1>
       <p class="session-sub" id="sessionSubtitle">Ask anything. Get answers from 3 AI models.</p>
     </div>
-    <div class="header-right">
+    <div class="header-right" style="display:flex;align-items:center;gap:6px;">
+      <span id="authStatusPill" style="font-size:11px;font-weight:600;color:var(--muted);max-width:78px;line-height:1.2;text-align:right"></span>
+      <button type="button" class="btn-icon" onclick="openAuthModal()" aria-label="Account login" title="Login / Register">
+        <i class="fa-solid fa-key" aria-hidden="true"></i>
+      </button>
       <button type="button" class="btn-icon" onclick="openProfileSettings()" aria-label="Settings" title="Settings">
         <i class="fa-solid fa-gear" aria-hidden="true"></i>
       </button>
@@ -611,6 +615,32 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
     <div class="profile-actions">
       <button type="button" class="cancel-btn" onclick="hideProfileModal()" title="Dismiss"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
       <button type="button" class="save-btn" onclick="submitProfileSetup()" title="Save profile"><i class="fa-solid fa-check" aria-hidden="true"></i></button>
+    </div>
+  </div>
+</div>
+
+<div class="panel-backdrop" id="authModal" onclick="if(event.target===this) hideAuthModal()" role="presentation">
+  <div class="profile-modal-card" onclick="event.stopPropagation()">
+    <button type="button" class="panel-close profile-modal-close" onclick="hideAuthModal()" aria-label="Close">
+      <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+    </button>
+    <h2>Account</h2>
+    <p style="margin-bottom:16px;line-height:1.55;color:var(--muted);font-size:14px;">
+      Sign in to run the ensemble on this device.</p>
+
+    <div class="profile-field">
+      <label for="authEmail">Email</label>
+      <input id="authEmail" type="email" autocomplete="username" placeholder="you@example.com"/>
+    </div>
+    <div class="profile-field">
+      <label for="authPassword">Password</label>
+      <input id="authPassword" type="password" autocomplete="current-password" placeholder="Minimum 8 characters"/>
+    </div>
+
+    <div class="profile-actions" style="flex-wrap:wrap;justify-content:space-between;">
+      <button type="button" class="cancel-btn" onclick="authLogout()" title="Sign out">Logout</button>
+      <button type="button" class="save-btn" onclick="submitAuthLogin()">Login</button>
+      <button type="button" class="save-btn" onclick="submitAuthRegister()" title="Creates an account">Register</button>
     </div>
   </div>
 </div>
@@ -749,8 +779,98 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
 
 <script>
 const SERVER = "";
+const AUTH_STORAGE_KEY = "ensemble_access_token";
 let currentSession = null;
 let currentProfile = null;
+
+function jsonHeadersWithAuth(extra) {
+  const h = {"Content-Type": "application/json", ...(extra || {})};
+  const tok = localStorage.getItem(AUTH_STORAGE_KEY);
+  if (tok && tok.trim()) h.Authorization = "Bearer " + tok.trim();
+  return h;
+}
+
+function refreshAuthBadge() {
+  const el = document.getElementById("authStatusPill");
+  if (!el) return;
+  el.textContent = localStorage.getItem(AUTH_STORAGE_KEY) ? "Signed in" : "";
+}
+
+function openAuthModal() {
+  document.getElementById("authModal").classList.add("visible");
+  refreshAuthBadge();
+  syncBodyScrollLock();
+}
+
+function hideAuthModal() {
+  document.getElementById("authModal").classList.remove("visible");
+  syncBodyScrollLock();
+}
+
+async function submitAuthLogin() {
+  const email = document.getElementById("authEmail").value.trim();
+  const password = document.getElementById("authPassword").value;
+  if (!email || !password) {
+    updateStatus("Email and password required.", true);
+    return;
+  }
+  try {
+    const r = await fetch(SERVER + "/auth/login", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      updateStatus(typeof data.detail === "string" ? data.detail : "Please login", true);
+      return;
+    }
+    if (data.access_token) {
+      localStorage.setItem(AUTH_STORAGE_KEY, data.access_token);
+      refreshAuthBadge();
+      hideAuthModal();
+      updateStatus("Signed in.");
+    }
+  } catch (err) {
+    updateStatus("Login error: " + err.message, true);
+  }
+}
+
+async function submitAuthRegister() {
+  const email = document.getElementById("authEmail").value.trim();
+  const password = document.getElementById("authPassword").value;
+  if (!email || password.length < 8) {
+    updateStatus("Email and password (8+ chars) required.", true);
+    return;
+  }
+  try {
+    const r = await fetch(SERVER + "/auth/register", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      updateStatus(data.detail ? String(data.detail) : "Registration failed", true);
+      return;
+    }
+    if (data.access_token) {
+      localStorage.setItem(AUTH_STORAGE_KEY, data.access_token);
+      refreshAuthBadge();
+      hideAuthModal();
+      updateStatus("Account created and signed in.");
+    }
+  } catch (err) {
+    updateStatus("Register error: " + err.message, true);
+  }
+}
+
+function authLogout() {
+  localStorage.removeItem(AUTH_STORAGE_KEY);
+  refreshAuthBadge();
+  hideAuthModal();
+  updateStatus("Logged out.");
+}
 
 const META = {
   gpt:{label:"GPT", color:"#22c55e", emoji:"⚙️"},
@@ -1038,9 +1158,11 @@ function syncBodyScrollLock(){
   const nav = document.body.classList.contains("nav-drawer-open");
   const pm = document.getElementById("profileModal");
   const tpm = document.getElementById("benToolPickerModal");
+  const am = document.getElementById("authModal");
   const prof = pm && pm.classList.contains("visible");
   const pick = tpm && tpm.classList.contains("visible");
-  document.body.style.overflow = nav || prof || pick ? "hidden" : "";
+  const auth = am && am.classList.contains("visible");
+  document.body.style.overflow = nav || prof || pick || auth ? "hidden" : "";
 }
 
 function openNavDrawer(){
@@ -1625,13 +1747,34 @@ async function sendMessage(){
 
     const response = await fetch(SERVER + "/ensemble/stream", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: jsonHeadersWithAuth(),
       body: JSON.stringify({
         session_id: currentSession,
         question: msg,
         web_search: webSearchActive
       })
     });
+
+    if (response.status === 401) {
+      let detail = "Please login";
+      try {
+        const j = await response.json();
+        if (typeof j.detail === "string") detail = j.detail;
+      } catch (_x) {}
+      group.remove();
+      resetPipelineBar();
+      updateStatus(detail, true);
+      openAuthModal();
+      return;
+    }
+
+    if (!response.ok) {
+      const errTxt = await response.text().catch(() => "");
+      group.remove();
+      resetPipelineBar();
+      updateStatus("Stream error (" + response.status + "): " + (errTxt || response.statusText), true);
+      return;
+    }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -1933,6 +2076,7 @@ window.addEventListener("load", () => {
       this.style.height = Math.min(this.scrollHeight, 200) + "px";
     });
   }
+  refreshAuthBadge();
   loadSessions();
 });
 
@@ -1990,9 +2134,13 @@ document.addEventListener("keydown", (e) => {
     closeNavDrawer();
     const pm = document.getElementById("profileModal");
     if(pm && pm.classList.contains("visible")) hideProfileModal();
+    const am = document.getElementById("authModal");
+    if(am && am.classList.contains("visible")) hideAuthModal();
     return;
   }
   if(e.key === "Enter" && !e.shiftKey){
+    if (e.target && e.target.closest && e.target.closest("#authModal"))
+      return;
     e.preventDefault();
     sendMessage();
   }
