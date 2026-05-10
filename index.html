@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer" />
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
 <style>
 :root{
   --bg:#090909;
@@ -508,6 +509,15 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
   transition:transform .14s ease,opacity .14s;margin-bottom:2px;font-family:inherit}
 .send-btn:hover:not(:disabled){transform:scale(1.04);opacity:.95}
 .send-btn:disabled{opacity:.32;cursor:not-allowed}
+.composer-row.composer-loading textarea{
+  opacity:0.52;
+  cursor:not-allowed;
+}
+.composer-row.composer-loading .tool-btn,
+.composer-row.composer-loading #webSearchBtn{
+  opacity:0.45;
+  pointer-events:none;
+}
 
 .code-run-btn{
   position:absolute;top:10px;right:10px;padding:6px 11px;display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.078);
@@ -636,12 +646,21 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
       <label for="authPassword">Password</label>
       <input id="authPassword" type="password" autocomplete="current-password" placeholder="Minimum 8 characters"/>
     </div>
+    <div class="profile-field" style="margin-bottom:8px">
+      <label class="pill-sub" style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;color:var(--readable)">
+        <input type="checkbox" id="authRememberMe" checked/><span>Remember me on this device (7-day session)</span>
+      </label>
+    </div>
 
     <div class="profile-actions" style="flex-wrap:wrap;justify-content:space-between;">
       <button type="button" class="cancel-btn" onclick="authLogout()" title="Sign out">Logout</button>
-      <button type="button" class="save-btn" onclick="submitAuthLogin()">Login</button>
+      <button type="button" class="save-btn" id="authLoginBtn">Login</button>
       <button type="button" class="save-btn" onclick="submitAuthRegister()" title="Creates an account">Register</button>
+      <button type="button" class="cancel-btn" onclick="resetBenLocalState()" title="Clear saved token and reload login">Reset BEN</button>
     </div>
+    <p style="margin-top:14px;font-size:12px;color:var(--muted);text-align:center;line-height:1.45">
+      Stuck? <button type="button" class="cancel-btn" style="margin-left:4px;padding:6px 12px;font-size:12px" onclick="resetBenAppCache()" title="Clears local storage and reloads">Reset BEN (clear cache)</button>
+    </p>
   </div>
 </div>
 
@@ -742,7 +761,7 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
         </button>
         <input type="file" id="fileInput" style="display:none" onchange="handleFileUpload(this)">
       </div>
-      <div class="composer-row">
+      <div class="composer-row" id="composerRow">
         <textarea id="userInput" placeholder="Message AI Ensemble…" spellcheck="false" rows="1"></textarea>
         <button type="button" class="send-btn" id="sendBtn" onclick="sendMessage()" aria-label="Send message">
           <i class="fa-solid fa-paper-plane" aria-hidden="true"></i>
@@ -777,23 +796,323 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
   </div>
 </div>
 
+<div id="limit-tier-modal" class="upgrade-modal-backdrop">
+  <div class="relative mx-auto w-[min(92vw,440px)] rounded-2xl border border-indigo-500/30 bg-gradient-to-br from-slate-900 via-zinc-950 to-black p-8 shadow-[0_0_60px_-12px_rgba(99,102,241,0.45)] ring-1 ring-white/10 text-left font-sans">
+    <p class="text-xs font-semibold uppercase tracking-[0.2em] text-indigo-400/90">Free plan</p>
+    <h2 class="mt-2 text-xl font-bold tracking-tight text-white sm:text-2xl">Daily limit reached</h2>
+    <p class="mt-3 text-sm leading-relaxed text-slate-400">
+      You've reached your daily limit of 5 free insights. Upgrade to BEN Pro for unlimited access to Claude 3.5 Sonnet and GPT-4o.
+    </p>
+    <button type="button" onclick="openBillingUpgrade()" class="mt-6 w-full rounded-xl bg-indigo-600 px-5 py-3.5 text-center text-sm font-semibold text-white shadow-lg shadow-indigo-900/40 transition hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:ring-offset-2 focus:ring-offset-zinc-950">
+      Upgrade Now — $19/mo
+    </button>
+    <button type="button" class="mt-3 w-full rounded-xl border border-white/10 bg-white/5 px-5 py-2.5 text-sm font-medium text-slate-300 hover:bg-white/10" onclick="closeLimitTierModal()">Maybe later</button>
+  </div>
+</div>
+
 <script>
 const SERVER = "";
 const AUTH_STORAGE_KEY = "ensemble_access_token";
+/** Chat session UUID — survives JWT rotation / re-login (separate from access token). */
+const SESSION_STORAGE_KEY = "ensemble_last_session_id";
+
+/** Auth routing runs only after `authGuardReady` (see load). Blocks redirects while ensemble stream is active. */
+let authGuardReady = false;
+let ensembleStreamActive = false;
+
+window.__suppressNextUserEcho = false;
+window.__resumeSendAfterLogin = false;
+window.__pendingQuestion = "";
+/** After login/register: skip "tell us your name" modal so BEN stream / resume is visible. */
+window.__suppressProfilePromptOnce = false;
+
+async function completeLoginSuccessResume() {
+  hideAuthModal();
+  refreshAuthBadge();
+  window.__suppressProfilePromptOnce = true;
+  await loadSessions();
+  const resume = window.__resumeSendAfterLogin;
+  const pq = window.__pendingQuestion;
+  window.__resumeSendAfterLogin = false;
+  window.__pendingQuestion = "";
+  document.querySelectorAll(".inline-chat-login").forEach((el) => {
+    const g = el.closest(".message-group");
+    if (g) g.remove();
+  });
+  if (resume && pq) {
+    window.__suppressNextUserEcho = true;
+    const inp = document.getElementById("userInput");
+    if (inp) inp.value = pq;
+    await sendMessage();
+  }
+}
+
+window.loginUser = async function loginUser() {
+  const emailEl = document.getElementById("authEmail");
+  const passEl = document.getElementById("authPassword");
+  const email = emailEl ? emailEl.value.trim() : "";
+  const password = passEl ? passEl.value : "";
+  if (!email || !password) {
+    if (typeof window.updateStatus === "function") {
+      window.updateStatus("Email and password required.", true);
+    }
+    return;
+  }
+  const btn = document.getElementById("authLoginBtn");
+  function setLoginBtnBusy(busy) {
+    if (!btn) return;
+    btn.disabled = !!busy;
+    btn.textContent = busy ? "Connecting..." : "Login";
+  }
+  try {
+    setLoginBtnBusy(true);
+    let r;
+    try {
+      r = await fetch(SERVER + "/auth/login", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          email,
+          password,
+          remember_me: document.getElementById("authRememberMe")
+            ? !!document.getElementById("authRememberMe").checked
+            : true,
+        }),
+      });
+    } catch (fetchErr) {
+      console.error("loginUser fetch:", fetchErr);
+      if (typeof window.updateStatus === "function") {
+        window.updateStatus("Login error: " + fetchErr.message, true);
+      }
+      return;
+    }
+    let data = {};
+    try {
+      const text = await r.text();
+      if (text) data = JSON.parse(text);
+    } catch (parseErr) {
+      console.warn("loginUser parse:", parseErr);
+      data = {};
+    }
+    if (!r.ok) {
+      if (typeof window.updateStatus === "function") {
+        window.updateStatus(typeof data.detail === "string" ? data.detail : "Please login", true);
+      }
+      return;
+    }
+    const tok = data.access_token;
+    if (tok) {
+      try {
+        localStorage.setItem(AUTH_STORAGE_KEY, tok);
+        localStorage.setItem("auth_token", tok);
+        const verify =
+          localStorage.getItem(AUTH_STORAGE_KEY) ||
+          localStorage.getItem("auth_token");
+        if (verify !== tok) {
+          console.error("[login] token not persisted correctly after setItem");
+          if (typeof window.updateStatus === "function") {
+            window.updateStatus("Could not save session. Check browser storage.", true);
+          }
+          return;
+        }
+      } catch (se) {
+        console.error("[login] localStorage failed:", se);
+        if (typeof window.updateStatus === "function") {
+          window.updateStatus("Could not save session: " + se.message, true);
+        }
+        return;
+      }
+      await completeLoginSuccessResume();
+      return;
+    }
+    console.warn("loginUser: missing access_token", data);
+    if (typeof window.updateStatus === "function") {
+      window.updateStatus("Login response missing token.", true);
+    }
+  } catch (err) {
+    console.error("loginUser:", err);
+    if (typeof window.updateStatus === "function") {
+      window.updateStatus("Login error: " + (err && err.message ? err.message : String(err)), true);
+    }
+  } finally {
+    setLoginBtnBusy(false);
+  }
+};
+
+window.submitAuthLogin = window.loginUser;
+
 let currentSession = null;
 let currentProfile = null;
 
+function normalizeAppPath() {
+  let p = window.location.pathname || "/";
+  if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
+  return p === "" ? "/" : p;
+}
+
+/** Client-side JWT shape/exp check (same secret not verified; server rejects bad tokens on API calls). */
+function tokenLooksValid(tok) {
+  if (!tok || !String(tok).trim()) return false;
+  try {
+    const parts = String(tok).trim().split(".");
+    if (parts.length !== 3) return false;
+    let b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    const payload = JSON.parse(atob(b64));
+    if (payload.exp != null && payload.exp * 1000 < Date.now() - 5000) return false;
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+/** Persist preferred chat session (UUID) — independent of JWT. */
+function persistPreferredSessionId(sid) {
+  if (!sid || typeof sid !== "string") return;
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, sid);
+  } catch (_e) {}
+}
+
+function readPreferredSessionId() {
+  try {
+    const s = localStorage.getItem(SESSION_STORAGE_KEY);
+    return s && String(s).trim() ? String(s).trim() : "";
+  } catch (_e) {
+    return "";
+  }
+}
+
+function getRawAuthToken() {
+  try {
+    const a = localStorage.getItem(AUTH_STORAGE_KEY);
+    if (a != null && String(a).trim()) return String(a).trim();
+    const legacy = localStorage.getItem("auth_token");
+    if (legacy != null && String(legacy).trim()) return String(legacy).trim();
+  } catch (_e) {}
+  return "";
+}
+
+/** True when chat already has threads — avoid redirect so users can finish reading. */
+function chatHasMessages() {
+  const chat = document.getElementById("chatArea");
+  return !!(chat && chat.querySelector(".message-group"));
+}
+
+function syncUrlWithAuthState() {
+  if (!authGuardReady) return;
+
+  const path = normalizeAppPath();
+  if (path === "/" && (ensembleStreamActive || isSending)) return;
+
+  const raw = getRawAuthToken();
+
+  if (tokenLooksValid(raw) && path === "/login") {
+    window.location.replace("/");
+    return;
+  }
+
+  /* Chat-first UX: never send anonymous users to /login — use modal + inline chat login instead. */
+}
+
+function wipeAllLocalStorage() {
+  try {
+    localStorage.clear();
+  } catch (_e) {}
+}
+
+/** Dev escape hatch: wipe client storage and reload at login (same as fresh install for this app). */
+function resetBenAppCache() {
+  try {
+    localStorage.clear();
+    sessionStorage.clear();
+  } catch (err) {
+    console.error("[resetBenAppCache]", err);
+    if (err && err.stack) console.error(err.stack);
+  }
+  window.location.href = "/login";
+}
+
+const SEND_BTN_HTML_IDLE = '<i class="fa-solid fa-paper-plane" aria-hidden="true"></i>';
+const SEND_BTN_HTML_BUSY = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i>';
+
+function setComposerSending(busy) {
+  const row = document.getElementById("composerRow");
+  const inp = document.getElementById("userInput");
+  const btn = document.getElementById("sendBtn");
+  const tools = document.querySelector(".composer-tools");
+  if (!inp || !btn) return;
+  if (busy) {
+    if (row) row.classList.add("composer-loading");
+    if (tools) tools.setAttribute("aria-disabled", "true");
+    inp.disabled = true;
+    btn.disabled = true;
+    btn.innerHTML = SEND_BTN_HTML_BUSY;
+    btn.setAttribute("aria-busy", "true");
+    btn.setAttribute("aria-label", "Sending…");
+  } else {
+    if (row) row.classList.remove("composer-loading");
+    if (tools) tools.removeAttribute("aria-disabled");
+    inp.disabled = false;
+    btn.disabled = false;
+    btn.innerHTML = SEND_BTN_HTML_IDLE;
+    btn.removeAttribute("aria-busy");
+    btn.setAttribute("aria-label", "Send message");
+  }
+}
+
 function jsonHeadersWithAuth(extra) {
   const h = {"Content-Type": "application/json", ...(extra || {})};
-  const tok = localStorage.getItem(AUTH_STORAGE_KEY);
-  if (tok && tok.trim()) h.Authorization = "Bearer " + tok.trim();
+  const tok = getRawAuthToken();
+  if (tok) h.Authorization = "Bearer " + tok;
   return h;
 }
 
 function refreshAuthBadge() {
   const el = document.getElementById("authStatusPill");
   if (!el) return;
-  el.textContent = localStorage.getItem(AUTH_STORAGE_KEY) ? "Signed in" : "";
+  const tok = getRawAuthToken();
+  el.textContent = tokenLooksValid(tok) ? "Signed in" : "";
+}
+
+function jwtExpiresAtMs(tok) {
+  if (!tok || !String(tok).trim()) return null;
+  try {
+    const parts = String(tok).trim().split(".");
+    if (parts.length !== 3) return null;
+    let b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    const payload = JSON.parse(atob(b64));
+    if (payload.exp == null) return null;
+    return payload.exp * 1000;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** Refresh JWT before it expires (sliding session) — no full page navigation. */
+async function refreshAccessTokenIfNeeded() {
+  const tok = getRawAuthToken();
+  if (!tok || !tokenLooksValid(tok)) return;
+  const expMs = jwtExpiresAtMs(tok);
+  if (expMs == null) return;
+  const refreshIfWithinMs = 20 * 60 * 1000;
+  if (expMs - Date.now() > refreshIfWithinMs) return;
+  try {
+    const r = await fetch(SERVER + "/auth/refresh", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + tok.trim() },
+    });
+    if (!r.ok) return;
+    const data = await r.json().catch(() => ({}));
+    const next = data.access_token;
+    if (!next) return;
+    localStorage.setItem(AUTH_STORAGE_KEY, next);
+    localStorage.setItem("auth_token", next);
+    refreshAuthBadge();
+  } catch (e) {
+    console.warn("[auth/refresh]", e);
+  }
 }
 
 function openAuthModal() {
@@ -807,34 +1126,35 @@ function hideAuthModal() {
   syncBodyScrollLock();
 }
 
-async function submitAuthLogin() {
-  const email = document.getElementById("authEmail").value.trim();
-  const password = document.getElementById("authPassword").value;
-  if (!email || !password) {
-    updateStatus("Email and password required.", true);
-    return;
-  }
+function closeLimitTierModal() {
+  const el = document.getElementById("limit-tier-modal");
+  if (el) el.classList.remove("visible");
+  syncBodyScrollLock();
+}
+
+async function openBillingUpgrade() {
   try {
-    const r = await fetch(SERVER + "/auth/login", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ email, password }),
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      updateStatus(typeof data.detail === "string" ? data.detail : "Please login", true);
-      return;
-    }
-    if (data.access_token) {
-      localStorage.setItem(AUTH_STORAGE_KEY, data.access_token);
-      refreshAuthBadge();
-      hideAuthModal();
-      updateStatus("Signed in.");
-    }
-  } catch (err) {
-    updateStatus("Login error: " + err.message, true);
+    const r = await fetch(SERVER + "/api/billing/checkout-url");
+    const j = await r.json();
+    if (j.url) window.location.href = j.url;
+    else window.location.href = SERVER + "/upgrade";
+  } catch (_e) {
+    window.location.href = SERVER + "/upgrade";
   }
 }
+
+function resetBenLocalState() {
+  try {
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+    localStorage.removeItem("auth_token");
+  } catch (e) {
+    console.warn("resetBenLocalState:", e);
+  }
+  refreshAuthBadge();
+  window.location.href = "/login";
+}
+
+window.resetBenLocalState = resetBenLocalState;
 
 async function submitAuthRegister() {
   const email = document.getElementById("authEmail").value.trim();
@@ -847,7 +1167,13 @@ async function submitAuthRegister() {
     const r = await fetch(SERVER + "/auth/register", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({
+        email,
+        password,
+        remember_me: document.getElementById("authRememberMe")
+          ? !!document.getElementById("authRememberMe").checked
+          : true,
+      }),
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) {
@@ -855,10 +1181,23 @@ async function submitAuthRegister() {
       return;
     }
     if (data.access_token) {
-      localStorage.setItem(AUTH_STORAGE_KEY, data.access_token);
-      refreshAuthBadge();
-      hideAuthModal();
-      updateStatus("Account created and signed in.");
+      const tok = data.access_token;
+      try {
+        localStorage.setItem(AUTH_STORAGE_KEY, tok);
+        localStorage.setItem("auth_token", tok);
+        const verify = getRawAuthToken();
+        if (verify !== tok) {
+          console.error("[register] token not persisted after setItem");
+          updateStatus("Could not save session. Check browser storage.", true);
+          return;
+        }
+      } catch (se) {
+        console.error("[register] localStorage:", se);
+        updateStatus("Could not save session: " + se.message, true);
+        return;
+      }
+      await completeLoginSuccessResume();
+      return;
     }
   } catch (err) {
     updateStatus("Register error: " + err.message, true);
@@ -866,10 +1205,12 @@ async function submitAuthRegister() {
 }
 
 function authLogout() {
-  localStorage.removeItem(AUTH_STORAGE_KEY);
+  wipeAllLocalStorage();
   refreshAuthBadge();
-  hideAuthModal();
-  updateStatus("Logged out.");
+  try {
+    history.replaceState({}, "", "/");
+  } catch (_e) {}
+  openAuthModal();
 }
 
 const META = {
@@ -1178,6 +1519,26 @@ function closeNavDrawer(){
 // SESSION MANAGEMENT
 // ========================
 
+async function ensureChatSession() {
+  if (currentSession) return true;
+  try {
+    const response = await fetch(SERVER + "/session/new", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ title: "Chat" }),
+    });
+    const data = await response.json();
+    if (data.success) {
+      currentSession = data.session_id;
+      persistPreferredSessionId(currentSession);
+      return true;
+    }
+  } catch (err) {
+    console.error("[ensureChatSession]", err);
+  }
+  return false;
+}
+
 async function createNewSession(){
   const title = prompt("Chat name:", "New Conversation");
   if(!title) return;
@@ -1192,6 +1553,7 @@ async function createNewSession(){
     const data = await response.json();
     if(data.success){
       currentSession = data.session_id;
+      persistPreferredSessionId(currentSession);
       loadSessions();
       loadChatHistory();
       updateStatus("Session created");
@@ -1267,6 +1629,7 @@ async function submitProfileSetup(){
       data = await response.json();
       if(data.success){
         currentSession = data.session_id;
+        persistPreferredSessionId(currentSession);
       }
     }
 
@@ -1302,12 +1665,22 @@ async function loadSessions(){
       `).join("");
 
       if(!currentSession && data.sessions.length > 0){
-        currentSession = data.sessions[0].session_id;
+        const pref = readPreferredSessionId();
+        const match = pref && data.sessions.some(s => s.session_id === pref);
+        currentSession = match ? pref : data.sessions[0].session_id;
       }
+      if (currentSession) persistPreferredSessionId(currentSession);
 
       const hasSession = Boolean(currentSession);
-      showWelcomeScreen(!hasSession);
-      showProfileModal(!hasSession);
+      const authed = tokenLooksValid(getRawAuthToken());
+      if (hasSession || authed) {
+        showWelcomeScreen(false);
+        showProfileModal(false);
+      } else {
+        /* Chat-first: never block guests with the profile setup modal */
+        showWelcomeScreen(true);
+        showProfileModal(false);
+      }
 
       if(hasSession){
         loadChatHistory();
@@ -1320,6 +1693,7 @@ async function loadSessions(){
 
 async function switchSession(sessionId){
   currentSession = sessionId;
+  persistPreferredSessionId(sessionId);
   closeNavDrawer();
   showWelcomeScreen(false);
   loadSessions();
@@ -1342,7 +1716,10 @@ async function loadChatHistory(){
         const remaining = Math.max(0, 3 - data.trial_count);
         document.getElementById('trial-indicator').textContent = `Free questions remaining: ${remaining}/3`;
       }
-      if(!currentProfile){
+      const skipProfilePrompt = window.__suppressProfilePromptOnce;
+      if (window.__suppressProfilePromptOnce) window.__suppressProfilePromptOnce = false;
+      const authedForProfile = tokenLooksValid(getRawAuthToken());
+      if (!currentProfile && !skipProfilePrompt && authedForProfile) {
         showProfileModal(true);
       }
       document.getElementById("sessionSubtitle").textContent =
@@ -1393,6 +1770,79 @@ function escapeHtml(text){
   return div.innerHTML;
 }
 
+/** Inline error when ensemble stream fails auth (avoid redirect so you can inspect DevTools). */
+function appendChatStreamError(groupEl, title, detail) {
+  if (!groupEl) return;
+  groupEl.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.className = "message assistant";
+  wrap.style.cssText =
+    "border-left:3px solid #a85858;padding:12px 14px;border-radius:12px;background:rgba(160,70,70,.1)";
+  wrap.innerHTML =
+    "<strong style=\"color:#e09898\">" +
+    escapeHtml(title) +
+    "</strong><p style=\"margin-top:8px;color:var(--readable)\">" +
+    escapeHtml(detail) +
+    "</p><p style=\"margin-top:10px;font-size:12px;color:var(--muted)\">" +
+    "No redirect — fix token/login and retry. Check Network tab for the Authorization header.</p>";
+  groupEl.appendChild(wrap);
+}
+
+function mountInlineChatLogin(groupEl, pendingMsg) {
+  if (!groupEl) return;
+  window.__pendingQuestion = pendingMsg;
+  window.__resumeSendAfterLogin = true;
+  groupEl.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.className = "message assistant inline-chat-login";
+  wrap.style.cssText =
+    "border:1px solid var(--border);border-radius:14px;padding:16px 18px;max-width:min(420px,100%);margin:6px 0;background:rgba(255,255,255,.03)";
+  wrap.innerHTML =
+    "<p style=\"font-weight:700;color:var(--title);margin-bottom:12px;font-size:15px\">Please login to continue</p>" +
+    "<label style=\"font-size:11px;color:var(--muted);display:block;margin-bottom:4px\">Email</label>" +
+    "<input id=\"chatInlineEmail\" type=\"email\" autocomplete=\"username\" style=\"width:100%;margin-bottom:10px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.06);color:var(--title);font:inherit\" placeholder=\"you@example.com\" />" +
+    "<label style=\"font-size:11px;color:var(--muted);display:block;margin-bottom:4px\">Password</label>" +
+    "<input id=\"chatInlinePassword\" type=\"password\" autocomplete=\"current-password\" style=\"width:100%;margin-bottom:14px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.06);color:var(--title);font:inherit\" placeholder=\"••••••••\" />" +
+    "<div style=\"display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px\">" +
+    "<button type=\"button\" id=\"chatInlineLoginBtn\" style=\"padding:10px 18px;border-radius:11px;font-weight:700;border:none;cursor:pointer;background:var(--title);color:#0a0a0a;font:inherit\">Login</button>" +
+    "<button type=\"button\" onclick=\"closeInlineChatLogin()\" style=\"padding:10px 14px;border-radius:11px;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--text);font:inherit\">Dismiss</button>" +
+    "</div>" +
+    "<p style=\"margin:0;font-size:12px;color:var(--muted);line-height:1.45\">Your question appears above. After login we send it automatically — no page reload.</p>";
+  groupEl.appendChild(wrap);
+  const btn = document.getElementById("chatInlineLoginBtn");
+  if (btn) btn.addEventListener("click", submitInlineChatLogin);
+  const pe = document.getElementById("chatInlinePassword");
+  if (pe) {
+    pe.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submitInlineChatLogin();
+      }
+    });
+  }
+}
+
+function submitInlineChatLogin() {
+  const ie = document.getElementById("chatInlineEmail");
+  const ip = document.getElementById("chatInlinePassword");
+  const ae = document.getElementById("authEmail");
+  const ap = document.getElementById("authPassword");
+  if (ae && ie) ae.value = ie.value.trim();
+  if (ap && ip) ap.value = ip.value;
+  window.__resumeSendAfterLogin = true;
+  loginUser();
+}
+
+function closeInlineChatLogin() {
+  window.__resumeSendAfterLogin = false;
+  window.__pendingQuestion = "";
+  document.querySelectorAll(".inline-chat-login").forEach((el) => {
+    el.closest(".message-group")?.remove();
+  });
+}
+
+window.closeInlineChatLogin = closeInlineChatLogin;
+
 function updateStatus(msg, isError = false){
   const el = document.getElementById("status");
   el.textContent = msg;
@@ -1422,6 +1872,7 @@ async function useExample(question){
       
       if(data.success){
         currentSession = data.session_id;
+        persistPreferredSessionId(currentSession);
         loadSessions();
         loadChatHistory();
       } else {
@@ -1716,10 +2167,6 @@ function cardHtml(model, text, category){
 
 async function sendMessage(){
   if (isSending) return;
-  if(!currentSession) {
-    updateStatus("Create or select a session first", true);
-    return;
-  }
 
   const msg = document.getElementById("userInput").value.trim();
   if(!msg){
@@ -1727,13 +2174,40 @@ async function sendMessage(){
     return;
   }
 
-  isSending = true;
-  document.getElementById("sendBtn").disabled = true;
-  updateStatus("Streaming ensemble…");
+  const suppressEcho = window.__suppressNextUserEcho;
+  window.__suppressNextUserEcho = false;
 
+  isSending = true;
   try {
+    const okSession = await ensureChatSession();
+    if(!okSession || !currentSession) {
+      updateStatus("Could not start a chat session.", true);
+      return;
+    }
+
+    let bearerTok = getRawAuthToken();
+    if (!bearerTok || !tokenLooksValid(bearerTok)) {
+      hideAuthModal();
+      hideProfileModal();
+      showWelcomeScreen(false);
+      if (!suppressEcho) appendUserMessage(msg);
+      document.getElementById("userInput").value = "";
+      const chat = document.getElementById("chatArea");
+      const group = document.createElement("div");
+      group.className = "message-group";
+      chat.appendChild(group);
+      chat.scrollTop = chat.scrollHeight;
+      mountInlineChatLogin(group, msg);
+      updateStatus("Please login to continue", true);
+      return;
+    }
+
+    setComposerSending(true);
+    updateStatus("BEN is thinking…");
+
+    try {
     showWelcomeScreen(false);
-    appendUserMessage(msg);
+    if (!suppressEcho) appendUserMessage(msg);
     document.getElementById("userInput").value = "";
 
     const chat = document.getElementById("chatArea");
@@ -1746,9 +2220,29 @@ async function sendMessage(){
     chat.appendChild(group);
     chat.scrollTop = chat.scrollHeight;
 
+    await refreshAccessTokenIfNeeded();
+    bearerTok = getRawAuthToken();
+    if (!bearerTok || !tokenLooksValid(bearerTok)) {
+      resetPipelineBar();
+      appendChatStreamError(
+        group,
+        "Session expired, please login again",
+        "Could not refresh your session. Use Account or the login prompt below."
+      );
+      updateStatus("Session expired", true);
+      return;
+    }
+
+    ensembleStreamActive = true;
+
+    const streamHeaders = {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + bearerTok,
+    };
+
     const response = await fetch(SERVER + "/ensemble/stream", {
       method: "POST",
-      headers: jsonHeadersWithAuth(),
+      headers: streamHeaders,
       body: JSON.stringify({
         session_id: currentSession,
         question: msg,
@@ -1762,10 +2256,37 @@ async function sendMessage(){
         const j = await response.json();
         if (typeof j.detail === "string") detail = j.detail;
       } catch (_x) {}
+      console.error("[ensemble/stream] 401 Unauthorized:", detail);
+      resetPipelineBar();
+      appendChatStreamError(
+        group,
+        "Session expired, please login again",
+        (detail || "Unauthorized") +
+          " Open Account from the header to sign in again. This page will not reload or redirect."
+      );
+      updateStatus("Session expired — please login again", true);
+      return;
+    }
+
+    if (response.status === 403) {
+      let errCode = null;
+      try {
+        const j = await response.json();
+        let d = j.detail;
+        if (typeof d === "string") {
+          try { d = JSON.parse(d); } catch (_p) {}
+        }
+        if (d && typeof d === "object" && d.error) errCode = d.error;
+      } catch (_x) {}
       group.remove();
       resetPipelineBar();
-      updateStatus(detail, true);
-      openAuthModal();
+      if (errCode === "LIMIT_REACHED") {
+        document.getElementById("limit-tier-modal").classList.add("visible");
+        syncBodyScrollLock();
+        updateStatus("Daily free limit reached.", true);
+      } else {
+        updateStatus("Request forbidden (403).", true);
+      }
       return;
     }
 
@@ -1776,6 +2297,8 @@ async function sendMessage(){
       updateStatus("Stream error (" + response.status + "): " + (errTxt || response.statusText), true);
       return;
     }
+
+    updateStatus("Streaming ensemble…");
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -1932,13 +2455,16 @@ async function sendMessage(){
       updateStatus("Turbo synthesis complete");
       loadSessions();
     }
-  } catch(err) {
-    updateStatus("Error: " + err.message, true);
-    resetPipelineBar();
-    console.error("[stream] fatal fetch/read error", err);
+    } catch(err) {
+      updateStatus("Error: " + err.message, true);
+      resetPipelineBar();
+      console.error("[stream] fatal fetch/read error", err);
+    } finally {
+      ensembleStreamActive = false;
+      setComposerSending(false);
+    }
   } finally {
     isSending = false;
-    document.getElementById("sendBtn").disabled = false;
   }
 }
 
@@ -2069,16 +2595,70 @@ async function executeCode(code, container){
     }
 }
 
+function wireAuthModalControls() {
+  const passEl = document.getElementById("authPassword");
+  if (passEl && !passEl.dataset.authWired) {
+    passEl.dataset.authWired = "1";
+    passEl.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      window.loginUser();
+    });
+  }
+  const loginBtn = document.getElementById("authLoginBtn");
+  if (loginBtn && !loginBtn.dataset.authWired) {
+    loginBtn.dataset.authWired = "1";
+    loginBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      window.loginUser();
+    });
+  }
+}
+
 window.addEventListener("load", () => {
   const inp = document.getElementById("userInput");
+  wireAuthModalControls();
   if (inp) {
     inp.addEventListener("input", function resizeComposer() {
       this.style.height = "auto";
       this.style.height = Math.min(this.scrollHeight, 200) + "px";
     });
+    inp.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      if (e.shiftKey) return;
+      e.preventDefault();
+      sendMessage();
+    });
   }
   refreshAuthBadge();
+  setTimeout(() => {
+    authGuardReady = true;
+    syncUrlWithAuthState();
+  }, 3000);
+  const path = normalizeAppPath();
+  const rawTok = getRawAuthToken();
+  const authed = tokenLooksValid(rawTok);
+
+  if (path === "/login") {
+    try {
+      history.replaceState({}, "", "/");
+    } catch (_e) {}
+    if (authed) {
+      hideAuthModal();
+    } else {
+      openAuthModal();
+    }
+  } else if (authed && path === "/") {
+    hideAuthModal();
+  }
   loadSessions();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (!authGuardReady) return;
+  if (ensembleStreamActive || isSending) return;
+  syncUrlWithAuthState();
 });
 
 async function handleUpgrade() {
@@ -2137,15 +2717,16 @@ document.addEventListener("keydown", (e) => {
     if(pm && pm.classList.contains("visible")) hideProfileModal();
     const am = document.getElementById("authModal");
     if(am && am.classList.contains("visible")) hideAuthModal();
+    const lm = document.getElementById("limit-tier-modal");
+    if(lm && lm.classList.contains("visible")) closeLimitTierModal();
     return;
   }
-  if(e.key === "Enter" && !e.shiftKey){
-    if (e.target && e.target.closest && e.target.closest("#authModal"))
-      return;
-    e.preventDefault();
-    sendMessage();
-  }
 });
+
+/* Explicit globals for inline onclick / DevTools */
+window.submitAuthRegister = submitAuthRegister;
+window.authLogout = authLogout;
+window.resetBenAppCache = resetBenAppCache;
 </script>
 
 </body>
