@@ -146,6 +146,18 @@
       </section>
 
       <section>
+        <h2>Cloud infrastructure cost</h2>
+        <p class="muted" style="margin:0 0 12px;">Railway projected usage (GraphQL estimatedUsage). Credits “left” use optional hints if Railway does not expose a balance here.</p>
+        <div id="railwayCloudMount"></div>
+      </section>
+
+      <section>
+        <h2>Monetization &amp; smart routing</h2>
+        <p class="muted" style="margin:0 0 12px;">Free tier uses cheaper model lanes only; Pro unlocks full Claude + premium GPT/Gemini.</p>
+        <div id="monetizationMount"></div>
+      </section>
+
+      <section>
         <h2>Config check (Railway / env)</h2>
         <p class="muted" style="margin:0 0 12px;">Presence only — secrets are never shown.</p>
         <div id="configMount"></div>
@@ -155,6 +167,7 @@
       <section>
         <h2>Founder’s playbook</h2>
         <p class="muted" style="margin:16px 0 0;"><strong>New or rotated API key on Railway:</strong> open your project → select the running service → <strong>Variables</strong> → add or edit the variable name (<code style="color:var(--accent)">OPENAI_API_KEY</code>, <code style="color:var(--accent)">GEMINI_KEY</code>, or <code style="color:var(--accent)">ANTHROPIC_API_KEY</code>) → paste the new secret → redeploy so the container reloads env.</p>
+        <p class="muted" style="margin:14px 0 0;"><strong>Railway API token (Cloud Infrastructure Cost):</strong> open <a class="home" href="https://railway.com/account/tokens">railway.com/account/tokens</a> → create an <strong>Account</strong> or <strong>Workspace</strong> token → add it as <code style="color:var(--accent)">RAILWAY_TOKEN</code> or <code style="color:var(--accent)">RAILWAY_API_KEY</code> in service Variables (never commit it). Optional: <code style="color:var(--accent)">RAILWAY_WORKSPACE_ID</code>, <code style="color:var(--accent)">RAILWAY_PROJECT_ID</code>, <code style="color:var(--accent)">RAILWAY_CREDITS_REMAINING_HINT_USD</code> to mirror credits from the billing UI.</p>
       </section>
 
       <section class="auditor">
@@ -347,6 +360,85 @@
       mount.appendChild(kv);
     }
 
+    function fmtUsd(v) {
+      if (v == null || !Number.isFinite(Number(v))) return "—";
+      return "$" + Number(v).toFixed(4);
+    }
+
+    function renderRailwayCloud(data) {
+      const mount = document.getElementById("railwayCloudMount");
+      if (!mount) return;
+      const rc = data.railway_cloud || {};
+      mount.innerHTML = "";
+      const warn = (msg) => {
+        mount.appendChild(el("p", { class: "muted", style: "margin:0;" }, [document.createTextNode(msg)]));
+      };
+      if (rc.error) {
+        warn(rc.error);
+      }
+      if (rc.graphql_error) {
+        mount.appendChild(el("p", {
+          class: "muted",
+          style: "margin:10px 0 0;font-size:0.78rem;line-height:1.35;word-break:break-word;",
+        }, [document.createTextNode("GraphQL: " + rc.graphql_error)]));
+      }
+      const head = [];
+      if (rc.workspace_name) head.push(rc.workspace_name);
+      if (rc.plan_summary) head.push(rc.plan_summary);
+      if (head.length) {
+        mount.appendChild(el("p", { style: "margin:0 0 12px;font-size:0.92rem;font-weight:600;color:var(--text);" },
+          [document.createTextNode(head.join(" · "))]));
+      }
+      const kv = el("div", { class: "perf-kv" });
+      kv.appendChild(el("div", { html:
+        `<span>Credits remaining (hint / allowance)</span><strong>${fmtUsd(rc.credits_remaining_usd)}</strong>` }));
+      kv.appendChild(el("div", { html:
+        `<span>Projected billing cycle usage (estimated)</span><strong>${fmtUsd(rc.projected_cycle_spend_usd)}</strong>` }));
+      kv.appendChild(el("div", { html:
+        `<span>Est. monthly burn (from cycle ÷ 30 × 30)</span><strong>${fmtUsd(rc.estimated_monthly_burn_usd)}</strong>` }));
+      kv.appendChild(el("div", { html:
+        `<span>Est. daily run rate</span><strong>${fmtUsd(rc.estimated_daily_spend_usd)}</strong>` }));
+      if (rc.measurement_rows != null) {
+        kv.appendChild(el("div", { html:
+          `<span>Usage estimate rows</span><strong>${rc.measurement_rows}</strong>` }));
+      }
+      if (rc.graphql_url) {
+        kv.appendChild(el("div", { html:
+          `<span>GraphQL endpoint</span><strong style="font-size:0.78rem;font-weight:500;word-break:break-all;">${rc.graphql_url}</strong>` }));
+      }
+      mount.appendChild(kv);
+      if (rc.credits_line) {
+        mount.appendChild(el("p", {
+          class: "muted",
+          style: "margin:12px 0 0;font-size:0.8rem;line-height:1.4;",
+        }, [document.createTextNode(rc.credits_line)]));
+      }
+      if (!rc.configured && !rc.error) {
+        warn("Add RAILWAY_TOKEN (or RAILWAY_API_KEY) in Railway Variables to load projected usage.");
+      }
+    }
+
+    function renderMonetization(data) {
+      const elMount = document.getElementById("monetizationMount");
+      if (!elMount) return;
+      const m = data.monetization || {};
+      elMount.innerHTML = "";
+      const wrap = el("div", { class: "perf-kv" });
+      wrap.appendChild(el("div", { html:
+        `<span>Free tier · rolling 24h cap</span><strong>${m.free_user_limit_24h != null ? m.free_user_limit_24h + " msgs" : "—"}</strong>` }));
+      wrap.appendChild(el("div", { html:
+        `<span>Free routing</span><strong style="font-size:0.82rem;font-weight:500;">${m.free_models || "—"}</strong>` }));
+      wrap.appendChild(el("div", { html:
+        `<span>Pro routing</span><strong style="font-size:0.82rem;font-weight:500;">${m.pro_models || "—"}</strong>` }));
+      elMount.appendChild(wrap);
+      if (m.routing_note) {
+        elMount.appendChild(el("p", {
+          class: "muted",
+          style: "margin:12px 0 0;font-size:0.8rem;line-height:1.45;",
+        }, [document.createTextNode(m.routing_note)]));
+      }
+    }
+
     function renderExecSelfHeal(data) {
       const b = document.getElementById("execSelfHealBanner");
       const line = data.self_heal_exec_line ||
@@ -422,6 +514,8 @@
         document.getElementById("truthMsg").textContent = data.truth_message || "";
         renderCfo(data.cfo);
         renderExecSelfHeal(data);
+        renderRailwayCloud(data);
+        renderMonetization(data);
         renderConfigDash(data);
         renderPerf(data);
         renderAuditor((data.auditor && data.auditor.uncommitted_files) || []);

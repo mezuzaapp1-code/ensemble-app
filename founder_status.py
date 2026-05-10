@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
@@ -342,6 +343,242 @@ def _env_nonempty(name: str) -> bool:
     return bool((os.getenv(name) or "").strip())
 
 
+def _railway_bearer_token() -> str:
+    return (os.getenv("RAILWAY_TOKEN") or os.getenv("RAILWAY_API_KEY") or "").strip()
+
+
+RAILWAY_GQL_URL = (os.getenv("RAILWAY_GRAPHQL_URL") or "https://backboard.railway.com/graphql/v2").strip()
+
+_RAILWAY_MEASUREMENTS = [
+    "CPU_USAGE",
+    "CPU_LIMIT",
+    "MEMORY_USAGE_GB",
+    "MEMORY_LIMIT_GB",
+    "DISK_USAGE_GB",
+    "EPHEMERAL_DISK_USAGE_GB",
+    "NETWORK_RX_GB",
+    "NETWORK_TX_GB",
+    "BACKUP_USAGE_GB",
+]
+
+
+async def _railway_gql(
+    token: str, query: str, variables: Optional[dict] = None
+) -> tuple[Optional[dict], Optional[str]]:
+    variables = variables or {}
+    payload = {"query": query.strip(), "variables": variables}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(RAILWAY_GQL_URL, json=payload, headers=headers)
+            r.raise_for_status()
+            body = r.json()
+    except Exception as exc:
+        return None, str(exc)[:800]
+    errs = body.get("errors") or []
+    err_msg = None
+    if errs:
+        err_msg = "; ".join(str(e.get("message", e)) for e in errs)[:900]
+    return body.get("data"), err_msg
+
+
+async def railway_cloud_infra_snapshot() -> dict:
+    """
+    Billing-ish signals from Railway Public GraphQL (estimatedUsage sums).
+    Credits “left” are not always exposed reliably; optionally mirror dashboard via env hints.
+    """
+    out: dict[str, Any] = {
+        "configured": False,
+        "graphql_url": RAILWAY_GQL_URL.split("?", 1)[0],
+        "error": None,
+        "graphql_error": None,
+        "workspace_id": None,
+        "workspace_name": None,
+        "plan_summary": None,
+        "subscription_plan_limit": None,
+        "projected_cycle_spend_usd": None,
+        "estimated_daily_spend_usd": None,
+        "estimated_monthly_burn_usd": None,
+        "credits_remaining_usd": None,
+        "credits_line": "",
+        "measurement_rows": 0,
+    }
+    token = _railway_bearer_token()
+    if not token:
+        out["error"] = "Add RAILWAY_TOKEN or RAILWAY_API_KEY (Railway account / workspace token)."
+        return out
+    out["configured"] = True
+
+    wid = (os.getenv("RAILWAY_WORKSPACE_ID") or "").strip()
+    ws_name = None
+
+    if not wid:
+        q_ws = """
+        query FounderWorkspaces {
+          workspaces {
+            edges {
+              node {
+                id
+                name
+              }
+            }
+          }
+        }
+        """
+        data, err = await _railway_gql(token, q_ws, {})
+        if err and not data:
+            out["graphql_error"] = err
+            out["error"] = "Could not list workspaces via GraphQL. Set RAILWAY_WORKSPACE_ID manually."
+            return out
+        if err:
+            out["graphql_error"] = err
+        edges = (((data or {}).get("workspaces") or {}).get("edges")) or []
+        nodes = [e.get("node") or {} for e in edges if isinstance(e, dict)]
+        if len(nodes) == 1:
+            wid = str(nodes[0].get("id") or "").strip()
+            ws_name = (nodes[0].get("name") or "").strip() or None
+        elif nodes:
+            want = (os.getenv("RAILWAY_WORKSPACE_NAME_MATCH") or "").strip().lower()
+            pick = None
+            if want:
+                for n in nodes:
+                    if str(n.get("name") or "").strip().lower() == want:
+                        pick = n
+                        break
+            if pick is None:
+                out["error"] = (
+                    "Multiple workspaces on this token — set RAILWAY_WORKSPACE_ID "
+                    "(Ctrl/Cmd+K in Railway dashboard → copy id), optionally RAILWAY_WORKSPACE_NAME_MATCH."
+                )
+                return out
+            wid = str(pick.get("id") or "").strip()
+            ws_name = (pick.get("name") or "").strip() or None
+
+    if not wid:
+        out["error"] = "Missing RAILWAY_WORKSPACE_ID and workspace list was empty."
+        return out
+
+    q_w = """
+    query FounderWorkspaceMeta($wid: String!) {
+      workspace(workspaceId: $wid) {
+        id
+        name
+        plan
+        subscriptionModel
+        subscriptionPlanLimit
+      }
+    }
+    """
+    meta, err = await _railway_gql(token, q_w, {"wid": wid})
+    if err and not meta:
+        out["graphql_error"] = err
+        out["error"] = "Could not load workspace meta (check token scope and workspace id)."
+        return out
+    if err:
+        out["graphql_error"] = err
+    wm = ((meta or {}).get("workspace")) or {}
+    out["workspace_id"] = str(wm.get("id") or wid)
+    out["workspace_name"] = (wm.get("name") or ws_name or "").strip() or None
+    plan = wm.get("plan")
+    subm = wm.get("subscriptionModel")
+    parts = [str(x) for x in (plan, subm) if x]
+    out["plan_summary"] = " · ".join(parts) if parts else None
+    spl = wm.get("subscriptionPlanLimit")
+    out["subscription_plan_limit"] = spl
+
+    q_est = """
+    query FounderEstimated($wid: String!, $meas: [MetricMeasurement!]!, $inc: Boolean!) {
+      estimatedUsage(
+        workspaceId: $wid
+        measurements: $meas
+        includeDeleted: $inc
+      ) {
+        estimatedValue
+        measurement
+        projectId
+      }
+    }
+    """
+    pid = (os.getenv("RAILWAY_PROJECT_ID") or "").strip() or None
+    q_est_proj = """
+    query FounderEstimatedProject($pid: String!, $meas: [MetricMeasurement!]!, $inc: Boolean!) {
+      estimatedUsage(
+        projectId: $pid
+        measurements: $meas
+        includeDeleted: $inc
+      ) {
+        estimatedValue
+        measurement
+        projectId
+      }
+    }
+    """
+    meas_try = list(_RAILWAY_MEASUREMENTS)
+    rows: list[dict] = []
+    last_est_err = None
+    while meas_try:
+        scope = {"meas": meas_try, "inc": False}
+        if pid:
+            data_e, er = await _railway_gql(token, q_est_proj, {"pid": pid, **scope})
+        else:
+            data_e, er = await _railway_gql(token, q_est, {"wid": wid, **scope})
+        block = ((data_e or {}).get("estimatedUsage")) if data_e is not None else None
+        if isinstance(block, list) and block:
+            rows = [r for r in block if isinstance(r, dict)]
+            last_est_err = er
+            break
+        last_est_err = er
+        if len(meas_try) <= 1:
+            rows = []
+            break
+        meas_try = meas_try[:-1]
+
+    if last_est_err and not rows:
+        out["graphql_error"] = (out.get("graphql_error") or "").strip()
+        sep = "; " if out["graphql_error"] else ""
+        out["graphql_error"] = (out["graphql_error"] or "") + sep + (last_est_err or "")
+    out["measurement_rows"] = len(rows)
+    total = 0.0
+    for r in rows:
+        try:
+            total += float(r.get("estimatedValue") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    if rows:
+        out["projected_cycle_spend_usd"] = round(total, 4)
+        daily = round(total / 30.0, 4)
+        out["estimated_daily_spend_usd"] = daily
+        out["estimated_monthly_burn_usd"] = round(daily * 30.0, 4)
+
+    hint = (os.getenv("RAILWAY_CREDITS_REMAINING_HINT_USD") or "").strip()
+    cycle_allow = (os.getenv("RAILWAY_INCLUDED_USAGE_USD_PER_CYCLE") or "").strip()
+    if hint:
+        try:
+            out["credits_remaining_usd"] = round(float(hint), 4)
+            out["credits_line"] = "Mirrors Railway UI via RAILWAY_CREDITS_REMAINING_HINT_USD."
+        except ValueError:
+            out["credits_line"] = "RAILWAY_CREDITS_REMAINING_HINT_USD is set but not a valid number."
+    elif cycle_allow and out["projected_cycle_spend_usd"] is not None:
+        try:
+            allow = float(cycle_allow)
+            out["credits_remaining_usd"] = round(max(0.0, allow - float(out["projected_cycle_spend_usd"])), 4)
+            out["credits_line"] = (
+                "Rough remainder: RAILWAY_INCLUDED_USAGE_USD_PER_CYCLE minus projected cycle (not official)."
+            )
+        except ValueError:
+            out["credits_line"] = "RAILWAY_INCLUDED_USAGE_USD_PER_CYCLE invalid."
+    else:
+        out["credits_line"] = (
+            "Railway does not always expose “credits left” on this API. "
+            "Set RAILWAY_CREDITS_REMAINING_HINT_USD to mirror the dashboard, "
+            "or RAILWAY_INCLUDED_USAGE_USD_PER_CYCLE (e.g. 5) for a rough estimate."
+        )
+
+    if not rows and not out.get("graphql_error"):
+        out["graphql_error"] = last_est_err
+    return out
+
+
 def railway_config_env_dashboard() -> dict:
     jwt_raw = (os.getenv("JWT_SECRET") or "").strip()
     jwt_secure = bool(jwt_raw) and jwt_raw != _JWT_PLACEHOLDER
@@ -419,6 +656,22 @@ def railway_config_env_dashboard() -> dict:
             present=_env_nonempty("FOUNDER_API_BUDGET_USD"),
             group="Enhancements",
             optional=True,
+        ),
+        mk(
+            env_key_display="RAILWAY_TOKEN or RAILWAY_API_KEY",
+            label="Railway GraphQL · Cloud Infrastructure Cost",
+            present=bool(_railway_bearer_token()),
+            group="Enhancements",
+            optional=True,
+            note="Optional — Bearer from railway.com/account/tokens; projected usage on /status.",
+        ),
+        mk(
+            env_key_display="RAILWAY_WORKSPACE_ID",
+            label="Railway workspace id",
+            present=_env_nonempty("RAILWAY_WORKSPACE_ID"),
+            group="Enhancements",
+            optional=True,
+            note="Optional — omit if this token sees exactly one workspace.",
         ),
         mk(
             env_key_display="ENSEMBLE_ANALYZER_MODEL",
@@ -588,6 +841,7 @@ def register_founders_routes(
             conn.close()
 
         railway_env = railway_config_env_dashboard()
+        railway_cloud = await railway_cloud_infra_snapshot()
 
         if n_runs == 0:
             truth_tip = "No consensus data yet — run a few ensemble chats to fill the truth meter."
@@ -611,6 +865,17 @@ def register_founders_routes(
             "based on model disagreements."
         )
 
+        free_lim = max(0, int(os.getenv("FREE_USER_LIMIT", "5") or "5"))
+        monetization = {
+            "free_user_limit_24h": free_lim,
+            "free_models": "gpt-4o-mini · gemini-1.5-flash (Claude lane off)",
+            "pro_models": "gpt-4o · gemini-1.5-pro · claude-3-5-sonnet-20241022",
+            "routing_note": (
+                "Smart routing: DB tier `free` uses budget lanes only; tier `pro` enables full ensemble "
+                "(including Claude). Usage rows enforce the rolling 24h cap."
+            ),
+        }
+
         return JSONResponse(
             {
                 "health": health,
@@ -622,6 +887,8 @@ def register_founders_routes(
                 "auditor": {"uncommitted_files": auditor_summaries},
                 "errors": get_last_errors_translated(3),
                 "railway_env": railway_env,
+                "railway_cloud": railway_cloud,
+                "monetization": monetization,
                 "self_heals_today": heals_today,
                 "self_heal_exec_line": exec_line,
             }

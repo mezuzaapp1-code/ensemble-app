@@ -241,9 +241,24 @@ def _init_db_sqlite(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT NOT NULL COLLATE NOCASE UNIQUE,
             password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            tier TEXT NOT NULL DEFAULT 'free',
+            stripe_customer_id TEXT
         )
     """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_ensemble_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            used_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_ensemble_usage_uid_time ON user_ensemble_usage (user_id, used_at)"
     )
     conn.commit()
 
@@ -325,9 +340,19 @@ def _init_db_postgres(conn: Any) -> None:
             id SERIAL PRIMARY KEY,
             email TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            tier VARCHAR(32) NOT NULL DEFAULT 'free',
+            stripe_customer_id TEXT
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS user_ensemble_usage (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_user_ensemble_usage_uid_time ON user_ensemble_usage (user_id, used_at)",
     ]
     for s in stmts:
         c.execute(s)
@@ -425,9 +450,38 @@ def _migrate_sqlite(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT NOT NULL COLLATE NOCASE UNIQUE,
             password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            tier TEXT NOT NULL DEFAULT 'free',
+            stripe_customer_id TEXT
         )
     """
+    )
+
+    ucols = _table_columns_sqlite(conn, "users")
+    if "tier" not in ucols:
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'")
+        except sqlite3.OperationalError:
+            pass
+        ucols.add("tier")
+    if "stripe_customer_id" not in ucols:
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_ensemble_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            used_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_ensemble_usage_uid_time ON user_ensemble_usage (user_id, used_at)"
     )
 
     c.execute(
@@ -498,4 +552,26 @@ def _migrate_postgres(conn: Any) -> None:
         )
         """
     )
+
+    ucols = _table_columns_postgres(conn, "users")
+    if "tier" not in ucols:
+        c.execute("ALTER TABLE users ADD COLUMN tier VARCHAR(32) NOT NULL DEFAULT 'free'")
+        ucols.add("tier")
+    if "stripe_customer_id" not in ucols:
+        c.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
+        ucols.add("stripe_customer_id")
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_ensemble_usage (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_ensemble_usage_uid_time ON user_ensemble_usage (user_id, used_at)"
+    )
+
     conn.commit()

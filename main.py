@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import time
 import io
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Optional
 from pathlib import Path
@@ -52,6 +54,7 @@ DOTENV_LOADED = load_dotenv(dotenv_path=DOTENV_PATH, override=False)
 # Local SQLite file path when not on Postgres (for logging / founder display)
 DB_PATH = SQLITE_DB_PATH
 INDEX_HTML = _BASE_DIR / "index.html"
+UPGRADE_HTML = _BASE_DIR / "upgrade.html"
 
 # Canonical IDs for probes, streaming, and fallbacks (no legacy haiku / 1.5-flash).
 MODEL_REGISTRY = {
@@ -72,6 +75,76 @@ OPENAI_DEFAULT_MODEL = MODEL_REGISTRY["openai_default"]
 CLAUDE_FALLBACK_MODELS = [m for m in MODEL_REGISTRY["claude_fallback_chain"] if m != CLAUDE_MODEL]
 GEMINI_FALLBACK_MODELS = list(MODEL_REGISTRY["gemini_fallback_chain"])
 
+FREE_USER_LIMIT = max(0, int(os.getenv("FREE_USER_LIMIT", "5") or "5"))
+
+_TIER_ROUTING_CTX: ContextVar[Optional["TierRouting"]] = ContextVar("_tier_routing_ctx", default=None)
+
+
+@dataclass(frozen=True)
+class TierRouting:
+    tier: str
+    openai_main: str
+    openai_fast: str
+    gemini_main: str
+    claude_main: Optional[str]
+    claude_fallbacks: tuple[str, ...]
+    ben_use_claude: bool
+
+
+def routing_for_db_tier(db_tier: Optional[str]) -> TierRouting:
+    t = (db_tier or "free").strip().lower()
+    if t == "pro":
+        return TierRouting(
+            tier="pro",
+            openai_main="gpt-4o",
+            openai_fast="gpt-4o",
+            gemini_main="gemini-1.5-pro",
+            claude_main="claude-3-5-sonnet-20241022",
+            claude_fallbacks=("claude-3-5-sonnet-20241022",),
+            ben_use_claude=True,
+        )
+    return TierRouting(
+        tier="free",
+        openai_main="gpt-4o-mini",
+        openai_fast="gpt-4o-mini",
+        gemini_main="gemini-1.5-flash",
+        claude_main=None,
+        claude_fallbacks=(),
+        ben_use_claude=False,
+    )
+
+
+def current_tier_routing() -> Optional[TierRouting]:
+    return _TIER_ROUTING_CTX.get()
+
+
+def effective_openai_default(model_key_hint: Optional[str] = None) -> str:
+    tr = current_tier_routing()
+    if tr:
+        if model_key_hint == "gpt-fast":
+            return tr.openai_fast
+        return tr.openai_main
+    return OPENAI_DEFAULT_MODEL
+
+
+def effective_gemini_default() -> str:
+    tr = current_tier_routing()
+    return tr.gemini_main if tr else GEMINI_FAST_MODEL
+
+
+def effective_claude_primary() -> Optional[str]:
+    tr = current_tier_routing()
+    if tr:
+        return tr.claude_main
+    return CLAUDE_MODEL
+
+
+def effective_claude_fallbacks_for_call() -> tuple[str, ...]:
+    tr = current_tier_routing()
+    if tr:
+        return tr.claude_fallbacks
+    return tuple(CLAUDE_FALLBACK_MODELS)
+
 
 def _gemini_candidate_models(primary: str) -> list[str]:
     seen: set[str] = set()
@@ -87,7 +160,7 @@ def _create_openai_client():
     if AsyncOpenAI is None:
         print(f"[startup] OpenAI SDK import failed; OpenAI disabled: {OPENAI_IMPORT_ERROR}")
         return None
-    key = os.getenv("OPENAI_API_KEY")
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not key:
         return None
     try:
@@ -98,7 +171,7 @@ def _create_openai_client():
 
 
 def _create_gemini_client():
-    key = os.getenv("GEMINI_KEY")
+    key = (os.getenv("GEMINI_KEY") or "").strip()
     if not key:
         return None
     try:
@@ -108,7 +181,7 @@ def _create_gemini_client():
 
 
 def _create_anthropic_client():
-    key = os.getenv("ANTHROPIC_API_KEY")
+    key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
     if not key:
         return None
     try:
@@ -132,7 +205,8 @@ DEV_MODE = os.getenv("ENSEMBLE_DEV_MODE", "").strip().lower() in ("1", "true", "
 # DATABASE INITIALIZATION (ensemble_db: SQLite or PostgreSQL from DATABASE_URL)
 # ========================
 
-JWT_EXPIRATION_SECONDS = int(os.getenv("JWT_EXPIRATION_SECONDS", str(24 * 3600)))
+JWT_SESSION_DAYS = max(1, int(os.getenv("JWT_SESSION_DAYS", "1")))
+JWT_REMEMBER_ME_DAYS = max(1, int(os.getenv("JWT_REMEMBER_ME_DAYS", "7")))
 auth_scheme = HTTPBearer(auto_error=False)
 
 
@@ -160,11 +234,12 @@ def normalize_account_email(raw: str) -> str:
     return em
 
 
-def create_access_token(user_id: int) -> str:
+def create_access_token(user_id: int, *, remember_me: bool = False) -> str:
     now = datetime.now(timezone.utc)
-    exp = now + timedelta(seconds=JWT_EXPIRATION_SECONDS)
+    days = JWT_REMEMBER_ME_DAYS if remember_me else JWT_SESSION_DAYS
+    exp = now + timedelta(days=days)
     token = jwt.encode(
-        {"sub": str(user_id), "iat": now, "exp": exp},
+        {"sub": str(user_id), "iat": now, "exp": exp, "rm": bool(remember_me)},
         _jwt_secret(),
         algorithm="HS256",
     )
@@ -177,6 +252,7 @@ def require_login(
         Depends(auth_scheme),
     ],
 ) -> int:
+    """Require ``Authorization: Bearer <jwt>``. Cookies are not used; missing/invalid token → 401."""
     if credentials is None or not getattr(credentials, "credentials", None):
         raise HTTPException(status_code=401, detail="Please login")
     token = credentials.credentials.strip()
@@ -185,7 +261,9 @@ def require_login(
     try:
         payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
         uid = int(payload.get("sub"))
-    except (jwt.PyJWTError, TypeError, ValueError):
+    except (jwt.PyJWTError, TypeError, ValueError) as exc:
+        if os.getenv("ENSEMBLE_DEBUG_AUTH", "").strip().lower() in ("1", "true", "yes", "on"):
+            print(f"[auth] JWT decode failed ({type(exc).__name__}): {exc}")
         raise HTTPException(status_code=401, detail="Please login")
 
     conn = connect_db()
@@ -704,11 +782,13 @@ class ActiveToolsRequest(BaseModel):
 class AuthRegisterBody(BaseModel):
     email: str = Field(..., min_length=3, max_length=320)
     password: str = Field(..., min_length=8)
+    remember_me: bool = False
 
 
 class AuthLoginBody(BaseModel):
     email: str = Field(..., min_length=3, max_length=320)
     password: str
+    remember_me: bool = False
 
 
 class FeedbackRequest(BaseModel):
@@ -721,6 +801,91 @@ class FeedbackRequest(BaseModel):
 def xe(cur: Any, sql: str, params: tuple | list = ()) -> Any:
     """Run SQL using ``?`` placeholders; adapted to ``%s`` on PostgreSQL."""
     return cur.execute(sqlq(sql), params)
+
+
+def fetch_user_account(uid: int) -> tuple[str, Optional[str]]:
+    conn = connect_db()
+    c = conn.cursor()
+    xe(c, "SELECT tier, stripe_customer_id FROM users WHERE id = ?", (uid,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return "free", None
+    tier = (row[0] or "free").strip().lower()
+    raw_sid = row[1]
+    sid = str(raw_sid).strip() if raw_sid else None
+    return tier, sid
+
+
+def count_user_ensemble_usage_24h(uid: int) -> int:
+    conn = connect_db()
+    c = conn.cursor()
+    if USE_POSTGRES:
+        xe(
+            c,
+            "SELECT COUNT(*) FROM user_ensemble_usage WHERE user_id = ? "
+            "AND used_at > NOW() - INTERVAL '24 hours'",
+            (uid,),
+        )
+    else:
+        xe(
+            c,
+            "SELECT COUNT(*) FROM user_ensemble_usage WHERE user_id = ? "
+            "AND datetime(used_at) > datetime('now', '-24 hours')",
+            (uid,),
+        )
+    n = int(c.fetchone()[0])
+    conn.close()
+    return n
+
+
+def record_user_ensemble_message(uid: int) -> None:
+    conn = connect_db()
+    c = conn.cursor()
+    try:
+        xe(c, "INSERT INTO user_ensemble_usage (user_id) VALUES (?)", (uid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+"""Shared DB row for ensemble usage when JWT is not required (FK target for ``user_ensemble_usage``)."""
+_ENSEMBLE_GUEST_EMAIL = "__ensemble_guest__@system.local"
+
+
+def get_or_create_guest_ensemble_user_id() -> int:
+    conn = connect_db()
+    c = conn.cursor()
+    xe(c, "SELECT id FROM users WHERE email = ?", (_ENSEMBLE_GUEST_EMAIL,))
+    row = c.fetchone()
+    if row:
+        uid = int(row[0])
+        conn.close()
+        return uid
+    pw = bcrypt.hashpw(b"__ensemble_guest_not_for_login__", bcrypt.gensalt()).decode("ascii")
+    try:
+        ins = "INSERT INTO users (email, password_hash, tier) VALUES (?, ?, 'free')"
+        if USE_POSTGRES:
+            ins += " RETURNING id"
+        xe(c, ins, (_ENSEMBLE_GUEST_EMAIL, pw))
+        conn.commit()
+        if USE_POSTGRES:
+            uid = int(c.fetchone()[0])
+        else:
+            uid = int(c.lastrowid)
+        conn.close()
+        return uid
+    except Exception:
+        conn.rollback()
+        conn.close()
+        conn = connect_db()
+        c = conn.cursor()
+        xe(c, "SELECT id FROM users WHERE email = ?", (_ENSEMBLE_GUEST_EMAIL,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return int(row[0])
+        raise
 
 
 # ========================
@@ -1015,7 +1180,7 @@ def update_session_timestamp(session_id):
 async def ask_gpt(prompt, session_id=None, model=None):
     """Call GPT with optional conversation context."""
     if model is None:
-        model = OPENAI_DEFAULT_MODEL
+        model = effective_openai_default()
     if openai_client is None:
         return "GPT Error: OpenAI client unavailable. Set OPENAI_API_KEY or check initialization."
     messages = [{"role": "user", "content": prompt}]
@@ -1033,10 +1198,13 @@ async def ask_gpt(prompt, session_id=None, model=None):
         model=model,
         messages=messages
     )
-    return response.choices[0].message.content
+    msg = response.choices[0].message
+    return msg.content or ""
 
-async def ask_gemini(prompt, session_id=None, model=GEMINI_MODEL):
+async def ask_gemini(prompt, session_id=None, model=None):
     """Call Gemini with optional conversation context."""
+    if model is None:
+        model = effective_gemini_default()
     if gemini_client is None:
         return "GEMINI Error: Gemini client unavailable. Set GEMINI_KEY or check initialization."
     if session_id:
@@ -1075,8 +1243,11 @@ async def ask_gemini(prompt, session_id=None, model=GEMINI_MODEL):
             raise
     raise last_error if last_error else RuntimeError("Gemini call failed with unknown error")
 
-async def ask_claude(prompt, session_id=None, system_prompt=None, model=CLAUDE_MODEL):
+async def ask_claude(prompt, session_id=None, system_prompt=None, model=None):
     """Call Claude with optional conversation context and system prompt"""
+    eff_model = model if model is not None else effective_claude_primary()
+    if eff_model is None:
+        return "CLAUDE Error: Claude is available on BEN Pro only."
     if claude_client is None:
         return "CLAUDE Error: Anthropic client unavailable. Set ANTHROPIC_API_KEY or check initialization."
     messages = [{"role": "user", "content": prompt}]
@@ -1090,7 +1261,7 @@ async def ask_claude(prompt, session_id=None, system_prompt=None, model=CLAUDE_M
             if "Error" not in content
         ] + messages
     
-    model_order = [model] + [m for m in CLAUDE_FALLBACK_MODELS if m != model]
+    model_order = [eff_model] + [m for m in effective_claude_fallbacks_for_call() if m != eff_model]
     last_error = None
     for candidate in model_order:
         kwargs = {
@@ -1126,9 +1297,9 @@ async def ask_model(model_key, prompt, session_id=None):
         elif model_key == "claude":
             return await ask_claude(prompt, session_id)
         elif model_key == "gpt-fast":
-            return await ask_gpt(prompt, session_id, model=OPENAI_DEFAULT_MODEL)
+            return await ask_gpt(prompt, session_id, model=effective_openai_default("gpt-fast"))
         elif model_key == "gemini-fast":
-            return await ask_gemini(prompt, session_id, model=GEMINI_FAST_MODEL)
+            return await ask_gemini(prompt, session_id, model=effective_gemini_default())
         else:
             return "Unknown model"
     except Exception as e:
@@ -1669,7 +1840,7 @@ async def run_credit_probe(emit_logs: bool = True) -> dict:
     if emit_logs:
         print("[startup] Anthropic env var name in use: ANTHROPIC_API_KEY")
     for provider, meta in checks.items():
-        has_key = bool(os.getenv(meta["env"]))
+        has_key = bool((os.getenv(meta["env"]) or "").strip())
         if has_key:
             meta["status"] = "Key OK"
             if emit_logs:
@@ -1719,6 +1890,14 @@ async def run_credit_probe(emit_logs: bool = True) -> dict:
 @app.on_event("startup")
 async def startup_api_connectivity_check():
     """Validate .env loading and quickly probe model APIs."""
+    jwt_raw = (os.getenv("JWT_SECRET") or "").strip()
+    if jwt_raw:
+        print(
+            f"[startup] JWT_SECRET is set (length {len(jwt_raw)}); "
+            "if you rotated this value, users must sign in again (401 until then)."
+        )
+    else:
+        print("[startup] JWT_SECRET unset — using embedded dev default for JWT signing.")
     checks = await run_credit_probe(emit_logs=True)
     for provider, meta in checks.items():
         if not meta["ready"] and meta["status"] not in ("Low Funds",):
@@ -1728,7 +1907,7 @@ async def startup_api_connectivity_check():
 async def stream_gpt_tokens(prompt, session_id=None, model=None):
     """Yield incremental text from OpenAI chat completions (streaming)."""
     if model is None:
-        model = OPENAI_DEFAULT_MODEL
+        model = effective_openai_default()
     if openai_client is None:
         yield "GPT Error: OpenAI client unavailable. Set OPENAI_API_KEY or check initialization."
         return
@@ -1750,8 +1929,10 @@ async def stream_gpt_tokens(prompt, session_id=None, model=None):
             yield piece
 
 
-async def stream_gemini_tokens(prompt, session_id=None, model=GEMINI_MODEL):
+async def stream_gemini_tokens(prompt, session_id=None, model=None):
     """Yield text from Gemini using stable SDK call (single-chunk)."""
+    if model is None:
+        model = effective_gemini_default()
     if gemini_client is None:
         yield "GEMINI Error: Gemini client unavailable. Set GEMINI_KEY or check initialization."
         return
@@ -1797,8 +1978,12 @@ async def stream_gemini_tokens(prompt, session_id=None, model=GEMINI_MODEL):
         raise last_error
 
 
-async def stream_claude_tokens(prompt, session_id=None, system_prompt=None, model=CLAUDE_MODEL):
+async def stream_claude_tokens(prompt, session_id=None, system_prompt=None, model=None):
     """Yield incremental text from Claude messages.stream."""
+    eff_model = model if model is not None else effective_claude_primary()
+    if eff_model is None:
+        yield "CLAUDE Error: Claude is available on BEN Pro only."
+        return
     if claude_client is None:
         yield "CLAUDE Error: Anthropic client unavailable. Set ANTHROPIC_API_KEY or check initialization."
         return
@@ -1811,7 +1996,7 @@ async def stream_claude_tokens(prompt, session_id=None, system_prompt=None, mode
             for role, content in history
             if "Error" not in content
         ] + msgs
-    model_order = [model] + [m for m in CLAUDE_FALLBACK_MODELS if m != model]
+    model_order = [eff_model] + [m for m in effective_claude_fallbacks_for_call() if m != eff_model]
     last_error = None
     for candidate in model_order:
         kwargs = {"model": candidate, "max_tokens": 1000, "messages": msgs}
@@ -1839,14 +2024,17 @@ async def stream_claude_tokens(prompt, session_id=None, system_prompt=None, mode
 
 async def stream_round1_model(model_key: str, prompt: str, session_id: str):
     """Dispatch Round 1 streaming by provider key."""
+    om_main = effective_openai_default()
+    om_fast = effective_openai_default("gpt-fast")
+    gm = effective_gemini_default()
     if model_key == "gpt":
-        async for t in stream_gpt_tokens(prompt, session_id, model=OPENAI_DEFAULT_MODEL):
+        async for t in stream_gpt_tokens(prompt, session_id, model=om_main):
             yield t
     elif model_key == "gpt-fast":
-        async for t in stream_gpt_tokens(prompt, session_id, model=OPENAI_DEFAULT_MODEL):
+        async for t in stream_gpt_tokens(prompt, session_id, model=om_fast):
             yield t
     elif model_key == "gemini":
-        async for t in stream_gemini_tokens(prompt, session_id, model=GEMINI_FAST_MODEL):
+        async for t in stream_gemini_tokens(prompt, session_id, model=gm):
             yield t
     elif model_key == "claude":
         async for t in stream_claude_tokens(prompt, session_id):
@@ -1877,11 +2065,21 @@ Produce a living synthesis: merge what is known, mark gaps as PROVISIONAL, use s
         "You are BEN, the Supreme Judge. This is a preliminary streaming synthesis; "
         "some model outputs may still be missing. Be concise. English only."
     )
+    tr = current_tier_routing()
+    if tr and not tr.ben_use_claude:
+        if openai_client is None:
+            yield "GPT Error: OpenAI client unavailable. Set OPENAI_API_KEY or check initialization."
+            return
+        combined = f"{ben_system}\n\n{ctx}"
+        async for text in stream_gpt_tokens(combined, session_id, model=tr.openai_main):
+            yield text
+        return
     if claude_client is None:
         yield "CLAUDE Error: Anthropic client unavailable. Set ANTHROPIC_API_KEY or check initialization."
         return
+    primary = effective_claude_primary() or CLAUDE_MODEL
     async with claude_client.messages.stream(
-        model=CLAUDE_MODEL,
+        model=primary,
         max_tokens=900,
         system=ben_system,
         messages=[{"role": "user", "content": ctx}],
@@ -1909,6 +2107,22 @@ STRICT INSTRUCTION: Respond in English only.
 
     ben_system_prompt = ben_supreme_judge_system_prompt()
     learned_user = _ben_auto_learned_suffix()
+    tr = current_tier_routing()
+    if tr and not tr.ben_use_claude:
+        if openai_client is None:
+            return BEN_EXPERTS_UNAVAILABLE_MSG
+        try:
+            return await ask_gpt(
+                ben_system_prompt
+                + "\n\n"
+                + context_for_ben
+                + learned_user
+                + "\n\nFollow the OUTPUT STRUCTURE from the system instructions above.",
+                session_id=session_id,
+                model=tr.openai_main,
+            )
+        except Exception as e:
+            return f"## TL;DR\n{BEN_EXPERTS_UNAVAILABLE_MSG}\n## Unified Answer\n({e})"
     if claude_client is None:
         if openai_client is not None:
             try:
@@ -1963,6 +2177,21 @@ STRICT INSTRUCTION: Respond in English only.
     ben_system_prompt = ben_supreme_judge_system_prompt()
 
     learned_user = _ben_auto_learned_suffix()
+    tr = current_tier_routing()
+    if tr and not tr.ben_use_claude:
+        if openai_client is None:
+            yield BEN_EXPERTS_UNAVAILABLE_MSG
+            return
+        full_prompt = (
+            ben_system_prompt
+            + "\n\n"
+            + context_for_ben
+            + learned_user
+            + "\n\nFollow the synthesis structure (TL;DR, headings, English)."
+        )
+        async for chunk in stream_gpt_tokens(full_prompt, session_id, model=tr.openai_main):
+            yield chunk
+        return
     if claude_client is None:
         if openai_client is not None:
             try:
@@ -1981,8 +2210,9 @@ STRICT INSTRUCTION: Respond in English only.
         return
 
     try:
+        primary = effective_claude_primary() or CLAUDE_MODEL
         async with claude_client.messages.stream(
-            model=CLAUDE_MODEL,
+            model=primary,
             max_tokens=1024,
             system=ben_system_prompt,
             messages=[{"role": "user", "content": context_for_ben}]
@@ -2038,10 +2268,48 @@ def auth_register(body: AuthRegisterBody):
         if is_unique_violation(ex):
             raise HTTPException(status_code=400, detail="Email already registered") from ex
         raise
+    xe(c, "SELECT tier FROM users WHERE id = ?", (user_id,))
+    trow = c.fetchone()
     conn.close()
+    tier_out = ((trow[0] or "free").strip().lower() if trow else "free")
 
-    tok = create_access_token(int(user_id))
-    return {"success": True, "access_token": tok, "token_type": "Bearer"}
+    tok = create_access_token(int(user_id), remember_me=bool(body.remember_me))
+    return {"success": True, "access_token": tok, "token_type": "Bearer", "tier": tier_out}
+
+
+@app.post("/auth/refresh")
+def auth_refresh(
+    credentials: Annotated[
+        Optional[HTTPAuthorizationCredentials],
+        Depends(auth_scheme),
+    ],
+):
+    """Issue a new JWT with the same remember-me duration as the current (still-valid) token."""
+    if credentials is None or not getattr(credentials, "credentials", None):
+        raise HTTPException(status_code=401, detail="Please login")
+    token = credentials.credentials.strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Please login")
+    try:
+        payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired") from None
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Please login") from None
+    try:
+        uid = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Please login") from None
+    remember_me = bool(payload.get("rm"))
+    conn = connect_db()
+    c = conn.cursor()
+    xe(c, "SELECT id FROM users WHERE id = ?", (uid,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="Please login")
+    tok = create_access_token(uid, remember_me=remember_me)
+    return {"access_token": tok, "token_type": "Bearer"}
 
 
 @app.post("/auth/login")
@@ -2049,7 +2317,7 @@ def auth_login(body: AuthLoginBody):
     email = normalize_account_email(body.email)
     conn = connect_db()
     c = conn.cursor()
-    xe(c, "SELECT id, password_hash FROM users WHERE email = ?", (email,))
+    xe(c, "SELECT id, password_hash, COALESCE(tier, 'free') FROM users WHERE email = ?", (email,))
     row = c.fetchone()
     conn.close()
     if row is None or not bcrypt.checkpw(
@@ -2058,14 +2326,35 @@ def auth_login(body: AuthLoginBody):
     ):
         raise HTTPException(status_code=401, detail="Please login")
 
-    tok = create_access_token(int(row[0]))
-    return {"access_token": tok, "token_type": "Bearer"}
+    tok = create_access_token(int(row[0]), remember_me=bool(body.remember_me))
+    tier_out = (row[2] or "free").strip().lower()
+    return {"access_token": tok, "token_type": "Bearer", "tier": tier_out}
 
 
 @app.get("/")
 async def serve_index():
     """Serve the main web UI."""
     return FileResponse(INDEX_HTML, media_type="text/html")
+
+
+@app.get("/login")
+async def serve_login():
+    """Same SPA shell as `/`; client routes by pathname (`/login` vs `/`)."""
+    return FileResponse(INDEX_HTML, media_type="text/html")
+
+
+@app.get("/upgrade")
+async def upgrade_landing():
+    """Stripe / checkout landing (see upgrade.html)."""
+    if UPGRADE_HTML.is_file():
+        return FileResponse(UPGRADE_HTML, media_type="text/html")
+    return HTMLResponse("<p>upgrade.html not found.</p>", status_code=404)
+
+
+@app.get("/api/billing/checkout-url")
+def billing_checkout_url():
+    """Expose Stripe Checkout URL from env for the upgrade page CTA."""
+    return {"url": STRIPE_CHECKOUT_URL}
 
 
 @app.post("/session/new")
@@ -2310,8 +2599,10 @@ async def research_examples(req: AskRequest):
     return {"success": True, "examples": examples}
 
 @app.post("/ensemble/run")
-async def run_ensemble(req: RunRequest, _uid: int = Depends(require_login)):
+async def run_ensemble(req: RunRequest):
     """Run the 3-round ensemble analysis with multi-turn capability"""
+    _uid = get_or_create_guest_ensemble_user_id()
+    tr_tok = None
     try:
         # Verify session exists + trial usage (single connection)
         conn = connect_db()
@@ -2320,6 +2611,15 @@ async def run_ensemble(req: RunRequest, _uid: int = Depends(require_login)):
         if not c.fetchone():
             conn.close()
             return {"success": False, "error": "Session not found"}
+
+        db_tier, _ = fetch_user_account(_uid)
+        routing = routing_for_db_tier(db_tier)
+        if routing.tier != "pro" and not DEV_MODE:
+            if count_user_ensemble_usage_24h(_uid) >= FREE_USER_LIMIT:
+                conn.close()
+                raise HTTPException(status_code=403, detail={"error": "LIMIT_REACHED"})
+        record_user_ensemble_message(_uid)
+        tr_tok = _TIER_ROUTING_CTX.set(routing)
 
         profile = get_profile(req.session_id)
         user_id = profile.get("user_name", "anonymous") if profile else "anonymous"
@@ -2335,14 +2635,7 @@ async def run_ensemble(req: RunRequest, _uid: int = Depends(require_login)):
             xe(c, "INSERT INTO trial_usage (user_identifier, trial_count) VALUES (?, 0)", (user_id,))
             conn.commit()
 
-        if not is_pro and trial_count >= 3 and not DEV_MODE:
-            conn.close()
-            return {
-                "success": False,
-                "error": "Trial Exceeded",
-                "trial_exceeded": True,
-                "trial_count": trial_count
-            }
+        # Legacy trial superseded by FREE_USER_LIMIT + tier for authenticated ensemble.
 
         enforce_ensemble_rate_limit(req.session_id, bool(is_pro))
 
@@ -2416,6 +2709,10 @@ Apply these learned weights automatically to prioritize the advice of the most a
 
         token_saver_mode = get_token_saver_mode(req.question)
         active_workspace_tools = get_profile_active_tool_set(req.session_id)
+        tier_allowed = {"gpt", "gemini"} if routing.tier == "free" else {"gpt", "gemini", "claude"}
+        active_workspace_tools = sorted(set(active_workspace_tools) & tier_allowed)
+        if not active_workspace_tools:
+            active_workspace_tools = ["gpt"]
         ben_tool_order = ["gpt", "gemini", "claude"]
         econ_lane_notice = "[Maintenance] Token saver mode: model skipped for cost efficiency."
         lane_off_notice = "(BEN Workspace: this analyst is turned off.)"
@@ -2430,12 +2727,16 @@ Apply these learned weights automatically to prioritize the advice of the most a
             routed_models = ["gpt"]
 
         skip_lane_r1_msgs: dict[str, str] = {}
+        tier_free_lane = "(BEN Free tier: Claude is available on BEN Pro.)"
         for mm in ben_tool_order:
             if mm in routed_models:
                 continue
-            skip_lane_r1_msgs[mm] = (
-                econ_lane_notice if token_saver_mode == "ECONOMY" and mm != "gpt" else lane_off_notice
-            )
+            if mm == "claude" and routing.tier == "free":
+                skip_lane_r1_msgs[mm] = tier_free_lane
+            else:
+                skip_lane_r1_msgs[mm] = (
+                    econ_lane_notice if token_saver_mode == "ECONOMY" and mm != "gpt" else lane_off_notice
+                )
 
         # =========================
         # ROUND 1
@@ -2593,7 +2894,10 @@ Find contradictions, shallow thinking, hidden assumptions, strategic weaknesses,
         econ_r2_skip = "[Maintenance] Skipped in ECONOMY mode."
 
         async def r2_for_run(mid: str):
+            tier_free_r2 = "(BEN Free tier: Claude is available on BEN Pro.)"
             if mid not in routed_models:
+                if mid == "claude" and routing.tier == "free":
+                    return tier_free_r2
                 if token_saver_mode == "ECONOMY" and mid != "gpt":
                     return econ_r2_skip
                 return lane_off_notice
@@ -2690,6 +2994,9 @@ Find contradictions, shallow thinking, hidden assumptions, strategic weaknesses,
             "success": False,
             "error": str(e)
         }
+    finally:
+        if tr_tok is not None:
+            _TIER_ROUTING_CTX.reset(tr_tok)
 
 @app.post("/upload")
 async def upload_global(session_id: str = Form(...), file: UploadFile = File(...)):
@@ -2775,8 +3082,15 @@ async def tools_similar_ai(req: SimilarAIToolsRequest):
 
 
 @app.post("/ensemble/stream")
-async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login)):
+async def run_ensemble_stream(req: RunRequest):
     """NDJSON stream: parallel Round 1 token streams, provisional BEN drafts, then consensus + R2 + final BEN."""
+    uid = get_or_create_guest_ensemble_user_id()
+    db_tier, _stripe_cust = fetch_user_account(uid)
+    routing = routing_for_db_tier(db_tier)
+    if routing.tier != "pro" and not DEV_MODE:
+        if count_user_ensemble_usage_24h(uid) >= FREE_USER_LIMIT:
+            raise HTTPException(status_code=403, detail={"error": "LIMIT_REACHED"})
+    record_user_ensemble_message(uid)
 
     profile = get_profile(req.session_id)
     user_id = profile.get("user_name", "anonymous") if profile else "anonymous"
@@ -2793,12 +3107,7 @@ async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login
         conn_pre.commit()
     conn_pre.close()
 
-    if not is_pro_pre and trial_count_pre >= 3 and not DEV_MODE:
-        async def trial_exceeded_gen():
-            payload = {"success": False, "error": "Trial Exceeded", "trial_exceeded": True}
-            yield f"data: {json.dumps(payload)}\n\n"
-
-        return StreamingResponse(trial_exceeded_gen(), media_type="text/event-stream")
+    # Legacy 3-message trial — superseded by tier + FREE_USER_LIMIT for logged-in users.
 
     enforce_ensemble_rate_limit(req.session_id, bool(is_pro_pre))
 
@@ -2813,6 +3122,7 @@ async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login
         def emit(payload: dict) -> str:
             # SSE framing: one JSON event per data line
             return f"data: {json.dumps(payload)}\n\n"
+        tr_var = _TIER_ROUTING_CTX.set(routing)
         try:
             conn = connect_db()
             c = conn.cursor()
@@ -2844,6 +3154,10 @@ async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login
 
             ensemble_wall_loop_start = asyncio.get_running_loop().time()
             active_workspace_tools = get_profile_active_tool_set(req.session_id)
+            tier_allowed = {"gpt", "gemini"} if routing.tier == "free" else {"gpt", "gemini", "claude"}
+            active_workspace_tools = sorted(set(active_workspace_tools) & tier_allowed)
+            if not active_workspace_tools:
+                active_workspace_tools = ["gpt"]
 
             web_data = ""
             if req.web_search:
@@ -2879,10 +3193,14 @@ async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login
                 routed_models = ["gpt"]
 
             skip_lane_banner: dict[str, str] = {}
+            tier_free_lane = "(BEN Free tier: Claude is available on BEN Pro.)"
             for mm in ben_tool_order:
                 if mm in routed_models:
                     continue
-                skip_lane_banner[mm] = econ_lane_notice if token_saver_mode == "ECONOMY" and mm != "gpt" else lane_off_notice
+                if mm == "claude" and routing.tier == "free":
+                    skip_lane_banner[mm] = tier_free_lane
+                else:
+                    skip_lane_banner[mm] = econ_lane_notice if token_saver_mode == "ECONOMY" and mm != "gpt" else lane_off_notice
 
             evt_q = asyncio.Queue()
             round1_live: dict[str, str] = {"gpt": "", "gemini": "", "claude": ""}
@@ -3095,9 +3413,12 @@ async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login
             print(f"DEBUG: OpenAI responded with: {openai_output[:100]}...")
 
             econ_r2_skip = "[Maintenance] Skipped in ECONOMY mode."
+            tier_free_r2 = "(BEN Free tier: Claude is available on BEN Pro.)"
 
             async def r2_for_model(mid: str):
                 if mid not in routed_models:
+                    if mid == "claude" and routing.tier == "free":
+                        return tier_free_r2
                     if token_saver_mode == "ECONOMY" and mid != "gpt":
                         return econ_r2_skip
                     return lane_off_notice
@@ -3241,6 +3562,8 @@ async def run_ensemble_stream(req: RunRequest, _uid: int = Depends(require_login
                     "session_cost": session_cost,
                 }
             )
+        finally:
+            _TIER_ROUTING_CTX.reset(tr_var)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

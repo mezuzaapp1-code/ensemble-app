@@ -816,35 +816,12 @@ const AUTH_STORAGE_KEY = "ensemble_access_token";
 /** Chat session UUID — survives JWT rotation / re-login (separate from access token). */
 const SESSION_STORAGE_KEY = "ensemble_last_session_id";
 
-/** Auth routing runs only after `authGuardReady` (see load). Blocks redirects while ensemble stream is active. */
-let authGuardReady = false;
 let ensembleStreamActive = false;
-
-window.__suppressNextUserEcho = false;
-window.__resumeSendAfterLogin = false;
-window.__pendingQuestion = "";
-/** After login/register: skip "tell us your name" modal so BEN stream / resume is visible. */
-window.__suppressProfilePromptOnce = false;
 
 async function completeLoginSuccessResume() {
   hideAuthModal();
   refreshAuthBadge();
-  window.__suppressProfilePromptOnce = true;
   await loadSessions();
-  const resume = window.__resumeSendAfterLogin;
-  const pq = window.__pendingQuestion;
-  window.__resumeSendAfterLogin = false;
-  window.__pendingQuestion = "";
-  document.querySelectorAll(".inline-chat-login").forEach((el) => {
-    const g = el.closest(".message-group");
-    if (g) g.remove();
-  });
-  if (resume && pq) {
-    window.__suppressNextUserEcho = true;
-    const inp = document.getElementById("userInput");
-    if (inp) inp.value = pq;
-    await sendMessage();
-  }
 }
 
 window.loginUser = async function loginUser() {
@@ -944,12 +921,6 @@ window.submitAuthLogin = window.loginUser;
 let currentSession = null;
 let currentProfile = null;
 
-function normalizeAppPath() {
-  let p = window.location.pathname || "/";
-  if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
-  return p === "" ? "/" : p;
-}
-
 /** Client-side JWT shape/exp check (same secret not verified; server rejects bad tokens on API calls). */
 function tokenLooksValid(tok) {
   if (!tok || !String(tok).trim()) return false;
@@ -993,28 +964,6 @@ function getRawAuthToken() {
   return "";
 }
 
-/** True when chat already has threads — avoid redirect so users can finish reading. */
-function chatHasMessages() {
-  const chat = document.getElementById("chatArea");
-  return !!(chat && chat.querySelector(".message-group"));
-}
-
-function syncUrlWithAuthState() {
-  if (!authGuardReady) return;
-
-  const path = normalizeAppPath();
-  if (path === "/" && (ensembleStreamActive || isSending)) return;
-
-  const raw = getRawAuthToken();
-
-  if (tokenLooksValid(raw) && path === "/login") {
-    window.location.replace("/");
-    return;
-  }
-
-  /* Chat-first UX: never send anonymous users to /login — use modal + inline chat login instead. */
-}
-
 function wipeAllLocalStorage() {
   try {
     localStorage.clear();
@@ -1030,7 +979,7 @@ function resetBenAppCache() {
     console.error("[resetBenAppCache]", err);
     if (err && err.stack) console.error(err.stack);
   }
-  window.location.href = "/login";
+  window.location.reload();
 }
 
 const SEND_BTN_HTML_IDLE = '<i class="fa-solid fa-paper-plane" aria-hidden="true"></i>';
@@ -1061,58 +1010,11 @@ function setComposerSending(busy) {
   }
 }
 
-function jsonHeadersWithAuth(extra) {
-  const h = {"Content-Type": "application/json", ...(extra || {})};
-  const tok = getRawAuthToken();
-  if (tok) h.Authorization = "Bearer " + tok;
-  return h;
-}
-
 function refreshAuthBadge() {
   const el = document.getElementById("authStatusPill");
   if (!el) return;
   const tok = getRawAuthToken();
   el.textContent = tokenLooksValid(tok) ? "Signed in" : "";
-}
-
-function jwtExpiresAtMs(tok) {
-  if (!tok || !String(tok).trim()) return null;
-  try {
-    const parts = String(tok).trim().split(".");
-    if (parts.length !== 3) return null;
-    let b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    while (b64.length % 4) b64 += "=";
-    const payload = JSON.parse(atob(b64));
-    if (payload.exp == null) return null;
-    return payload.exp * 1000;
-  } catch (_e) {
-    return null;
-  }
-}
-
-/** Refresh JWT before it expires (sliding session) — no full page navigation. */
-async function refreshAccessTokenIfNeeded() {
-  const tok = getRawAuthToken();
-  if (!tok || !tokenLooksValid(tok)) return;
-  const expMs = jwtExpiresAtMs(tok);
-  if (expMs == null) return;
-  const refreshIfWithinMs = 20 * 60 * 1000;
-  if (expMs - Date.now() > refreshIfWithinMs) return;
-  try {
-    const r = await fetch(SERVER + "/auth/refresh", {
-      method: "POST",
-      headers: { Authorization: "Bearer " + tok.trim() },
-    });
-    if (!r.ok) return;
-    const data = await r.json().catch(() => ({}));
-    const next = data.access_token;
-    if (!next) return;
-    localStorage.setItem(AUTH_STORAGE_KEY, next);
-    localStorage.setItem("auth_token", next);
-    refreshAuthBadge();
-  } catch (e) {
-    console.warn("[auth/refresh]", e);
-  }
 }
 
 function openAuthModal() {
@@ -1151,7 +1053,7 @@ function resetBenLocalState() {
     console.warn("resetBenLocalState:", e);
   }
   refreshAuthBadge();
-  window.location.href = "/login";
+  window.location.reload();
 }
 
 window.resetBenLocalState = resetBenLocalState;
@@ -1210,7 +1112,6 @@ function authLogout() {
   try {
     history.replaceState({}, "", "/");
   } catch (_e) {}
-  openAuthModal();
 }
 
 const META = {
@@ -1672,12 +1573,10 @@ async function loadSessions(){
       if (currentSession) persistPreferredSessionId(currentSession);
 
       const hasSession = Boolean(currentSession);
-      const authed = tokenLooksValid(getRawAuthToken());
-      if (hasSession || authed) {
+      if (hasSession) {
         showWelcomeScreen(false);
         showProfileModal(false);
       } else {
-        /* Chat-first: never block guests with the profile setup modal */
         showWelcomeScreen(true);
         showProfileModal(false);
       }
@@ -1715,12 +1614,6 @@ async function loadChatHistory(){
       if (data.trial_count !== undefined) {
         const remaining = Math.max(0, 3 - data.trial_count);
         document.getElementById('trial-indicator').textContent = `Free questions remaining: ${remaining}/3`;
-      }
-      const skipProfilePrompt = window.__suppressProfilePromptOnce;
-      if (window.__suppressProfilePromptOnce) window.__suppressProfilePromptOnce = false;
-      const authedForProfile = tokenLooksValid(getRawAuthToken());
-      if (!currentProfile && !skipProfilePrompt && authedForProfile) {
-        showProfileModal(true);
       }
       document.getElementById("sessionSubtitle").textContent =
         `Created: ${new Date(data.created_at).toLocaleString()}`;
@@ -1770,7 +1663,7 @@ function escapeHtml(text){
   return div.innerHTML;
 }
 
-/** Inline error when ensemble stream fails auth (avoid redirect so you can inspect DevTools). */
+/** Inline error when ensemble stream fails. */
 function appendChatStreamError(groupEl, title, detail) {
   if (!groupEl) return;
   groupEl.innerHTML = "";
@@ -1783,65 +1676,9 @@ function appendChatStreamError(groupEl, title, detail) {
     escapeHtml(title) +
     "</strong><p style=\"margin-top:8px;color:var(--readable)\">" +
     escapeHtml(detail) +
-    "</p><p style=\"margin-top:10px;font-size:12px;color:var(--muted)\">" +
-    "No redirect — fix token/login and retry. Check Network tab for the Authorization header.</p>";
+    "</p>";
   groupEl.appendChild(wrap);
 }
-
-function mountInlineChatLogin(groupEl, pendingMsg) {
-  if (!groupEl) return;
-  window.__pendingQuestion = pendingMsg;
-  window.__resumeSendAfterLogin = true;
-  groupEl.innerHTML = "";
-  const wrap = document.createElement("div");
-  wrap.className = "message assistant inline-chat-login";
-  wrap.style.cssText =
-    "border:1px solid var(--border);border-radius:14px;padding:16px 18px;max-width:min(420px,100%);margin:6px 0;background:rgba(255,255,255,.03)";
-  wrap.innerHTML =
-    "<p style=\"font-weight:700;color:var(--title);margin-bottom:12px;font-size:15px\">Please login to continue</p>" +
-    "<label style=\"font-size:11px;color:var(--muted);display:block;margin-bottom:4px\">Email</label>" +
-    "<input id=\"chatInlineEmail\" type=\"email\" autocomplete=\"username\" style=\"width:100%;margin-bottom:10px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.06);color:var(--title);font:inherit\" placeholder=\"you@example.com\" />" +
-    "<label style=\"font-size:11px;color:var(--muted);display:block;margin-bottom:4px\">Password</label>" +
-    "<input id=\"chatInlinePassword\" type=\"password\" autocomplete=\"current-password\" style=\"width:100%;margin-bottom:14px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.06);color:var(--title);font:inherit\" placeholder=\"••••••••\" />" +
-    "<div style=\"display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px\">" +
-    "<button type=\"button\" id=\"chatInlineLoginBtn\" style=\"padding:10px 18px;border-radius:11px;font-weight:700;border:none;cursor:pointer;background:var(--title);color:#0a0a0a;font:inherit\">Login</button>" +
-    "<button type=\"button\" onclick=\"closeInlineChatLogin()\" style=\"padding:10px 14px;border-radius:11px;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--text);font:inherit\">Dismiss</button>" +
-    "</div>" +
-    "<p style=\"margin:0;font-size:12px;color:var(--muted);line-height:1.45\">Your question appears above. After login we send it automatically — no page reload.</p>";
-  groupEl.appendChild(wrap);
-  const btn = document.getElementById("chatInlineLoginBtn");
-  if (btn) btn.addEventListener("click", submitInlineChatLogin);
-  const pe = document.getElementById("chatInlinePassword");
-  if (pe) {
-    pe.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        submitInlineChatLogin();
-      }
-    });
-  }
-}
-
-function submitInlineChatLogin() {
-  const ie = document.getElementById("chatInlineEmail");
-  const ip = document.getElementById("chatInlinePassword");
-  const ae = document.getElementById("authEmail");
-  const ap = document.getElementById("authPassword");
-  if (ae && ie) ae.value = ie.value.trim();
-  if (ap && ip) ap.value = ip.value;
-  window.__resumeSendAfterLogin = true;
-  loginUser();
-}
-
-function closeInlineChatLogin() {
-  window.__resumeSendAfterLogin = false;
-  window.__pendingQuestion = "";
-  document.querySelectorAll(".inline-chat-login").forEach((el) => {
-    el.closest(".message-group")?.remove();
-  });
-}
-
-window.closeInlineChatLogin = closeInlineChatLogin;
 
 function updateStatus(msg, isError = false){
   const el = document.getElementById("status");
@@ -2174,9 +2011,6 @@ async function sendMessage(){
     return;
   }
 
-  const suppressEcho = window.__suppressNextUserEcho;
-  window.__suppressNextUserEcho = false;
-
   isSending = true;
   try {
     const okSession = await ensureChatSession();
@@ -2185,29 +2019,14 @@ async function sendMessage(){
       return;
     }
 
-    let bearerTok = getRawAuthToken();
-    if (!bearerTok || !tokenLooksValid(bearerTok)) {
-      hideAuthModal();
-      hideProfileModal();
-      showWelcomeScreen(false);
-      if (!suppressEcho) appendUserMessage(msg);
-      document.getElementById("userInput").value = "";
-      const chat = document.getElementById("chatArea");
-      const group = document.createElement("div");
-      group.className = "message-group";
-      chat.appendChild(group);
-      chat.scrollTop = chat.scrollHeight;
-      mountInlineChatLogin(group, msg);
-      updateStatus("Please login to continue", true);
-      return;
-    }
-
     setComposerSending(true);
     updateStatus("BEN is thinking…");
 
     try {
     showWelcomeScreen(false);
-    if (!suppressEcho) appendUserMessage(msg);
+    hideAuthModal();
+    hideProfileModal();
+    appendUserMessage(msg);
     document.getElementById("userInput").value = "";
 
     const chat = document.getElementById("chatArea");
@@ -2220,53 +2039,17 @@ async function sendMessage(){
     chat.appendChild(group);
     chat.scrollTop = chat.scrollHeight;
 
-    await refreshAccessTokenIfNeeded();
-    bearerTok = getRawAuthToken();
-    if (!bearerTok || !tokenLooksValid(bearerTok)) {
-      resetPipelineBar();
-      appendChatStreamError(
-        group,
-        "Session expired, please login again",
-        "Could not refresh your session. Use Account or the login prompt below."
-      );
-      updateStatus("Session expired", true);
-      return;
-    }
-
     ensembleStreamActive = true;
-
-    const streamHeaders = {
-      "Content-Type": "application/json",
-      Authorization: "Bearer " + bearerTok,
-    };
 
     const response = await fetch(SERVER + "/ensemble/stream", {
       method: "POST",
-      headers: streamHeaders,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id: currentSession,
         question: msg,
         web_search: webSearchActive
       })
     });
-
-    if (response.status === 401) {
-      let detail = "Please login";
-      try {
-        const j = await response.json();
-        if (typeof j.detail === "string") detail = j.detail;
-      } catch (_x) {}
-      console.error("[ensemble/stream] 401 Unauthorized:", detail);
-      resetPipelineBar();
-      appendChatStreamError(
-        group,
-        "Session expired, please login again",
-        (detail || "Unauthorized") +
-          " Open Account from the header to sign in again. This page will not reload or redirect."
-      );
-      updateStatus("Session expired — please login again", true);
-      return;
-    }
 
     if (response.status === 403) {
       let errCode = null;
@@ -2631,34 +2414,7 @@ window.addEventListener("load", () => {
     });
   }
   refreshAuthBadge();
-  setTimeout(() => {
-    authGuardReady = true;
-    syncUrlWithAuthState();
-  }, 3000);
-  const path = normalizeAppPath();
-  const rawTok = getRawAuthToken();
-  const authed = tokenLooksValid(rawTok);
-
-  if (path === "/login") {
-    try {
-      history.replaceState({}, "", "/");
-    } catch (_e) {}
-    if (authed) {
-      hideAuthModal();
-    } else {
-      openAuthModal();
-    }
-  } else if (authed && path === "/") {
-    hideAuthModal();
-  }
   loadSessions();
-});
-
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
-  if (!authGuardReady) return;
-  if (ensembleStreamActive || isSending) return;
-  syncUrlWithAuthState();
 });
 
 async function handleUpgrade() {
