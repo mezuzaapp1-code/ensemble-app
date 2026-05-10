@@ -177,6 +177,10 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
   position:relative;
   background:var(--bg);
 }
+.main-content,#mainContent{
+  max-width:100%;
+  width:100%;
+}
 .main-content.welcome-active{}
 .main-content.welcome-active .chat-area{display:none}
 
@@ -298,10 +302,13 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
 @keyframes ben-dot-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.55;transform:scale(.86)}}
 .ben-stream-body.message{max-width:100%;padding-top:0}
 
-.chat-area{
+.chat-area,#chatArea{
   flex:1;overflow-y:auto;overflow-x:hidden;
   padding:clamp(28px,4vh,48px) clamp(20px,5vw,80px) 200px;
-  display:flex;flex-direction:column;gap:36px;width:100%;
+  display:flex;flex-direction:column;gap:36px;
+  max-width:900px;
+  width:100%;
+  margin:0 auto;
 }
 #chatArea{
   padding-bottom:180px;
@@ -471,7 +478,7 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
   cursor:pointer;transition:background .17s,border-color .17s}
 .next-action-btn:hover{background:rgba(255,255,255,.11);border-color:#393939}
 
-.composer-shell{position:fixed;bottom:0;left:0;right:0;z-index:150;padding:0 clamp(18px,3.5vw,36px) 22px;pointer-events:none}
+.composer-shell{position:fixed;bottom:0;left:0;right:0;z-index:150;padding:0 clamp(18px,3.5vw,36px) 22px;pointer-events:none;max-width:900px;width:100%;margin:0 auto}
 .composer-shell > *{pointer-events:auto}
 .composer-dock{width:100%;max-width:52rem;margin:0 auto}
 .composer-meta{
