@@ -3330,7 +3330,7 @@ async def run_ensemble_stream(req: RunRequest):
                     )
                     continue
                 if kind == "r1_chunk":
-                    _, mid, piece = rest
+                    mid, piece = rest
                     yield emit({"type": "round1_chunk", "model": mid, "content": piece})
                     continue
                 if kind == "r1_done":
