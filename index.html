@@ -139,6 +139,16 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
 
 .btn-icon-tight{width:34px;height:34px;border-radius:9px}
 .btn-inline-row{display:flex;gap:10px;margin-bottom:16px}
+.nav-new-chat-inline{display:none;margin:0 0 14px;padding:12px;border:1px solid var(--border);border-radius:14px;background:rgba(255,255,255,.035)}
+.nav-new-chat-inline.visible{display:block}
+.nav-new-chat-inline .nav-new-chat-input{
+  width:100%;box-sizing:border-box;padding:10px 12px;margin-bottom:10px;border-radius:10px;border:1px solid var(--border);
+  background:rgba(255,255,255,.06);color:var(--title);font:inherit;font-size:13px}
+.nav-new-chat-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+.nav-new-chat-btn{
+  padding:8px 14px;border-radius:10px;font:inherit;font-size:12px;font-weight:600;cursor:pointer;
+  border:1px solid var(--border);background:transparent;color:var(--readable)}
+.nav-new-chat-btn.nav-new-chat-primary{border-color:transparent;background:var(--title);color:#0a0a0a}
 
 .btn-primary-ico{
   flex:1;
@@ -597,6 +607,14 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
       <button type="button" class="btn-primary-ico" onclick="onNewChatClick()" title="New chat" aria-label="New chat">
         <i class="fa-solid fa-plus" aria-hidden="true"></i>
       </button>
+    </div>
+    <div id="navNewChatRow" class="nav-new-chat-inline" aria-hidden="true">
+      <label class="pill-sub" for="navNewChatTitle" style="display:block;margin-bottom:6px;font-size:11px;color:var(--muted);font-weight:600">New chat name</label>
+      <input type="text" id="navNewChatTitle" class="nav-new-chat-input" placeholder="e.g. Sprint planning" maxlength="120" autocomplete="off" />
+      <div class="nav-new-chat-actions">
+        <button type="button" class="nav-new-chat-btn nav-new-chat-primary" id="navNewChatCreateBtn">Create</button>
+        <button type="button" class="nav-new-chat-btn" id="navNewChatCancelBtn">Cancel</button>
+      </div>
     </div>
     <div id="profileGreeting" class="sidebar-greeting"></div>
     <div class="sessions-list" id="sessionsList"></div>
@@ -1401,9 +1419,67 @@ function revealLiveBenSection(wrapEl, opts){
   if(opts && opts.kicker && ktxt) ktxt.textContent = opts.kicker;
 }
 
-async function onNewChatClick(){
-  await createNewSession();
+function showNavNewChatInline(show) {
+  const row = document.getElementById("navNewChatRow");
+  const inp = document.getElementById("navNewChatTitle");
+  if (!row || !inp) return;
+  row.classList.toggle("visible", !!show);
+  row.setAttribute("aria-hidden", show ? "false" : "true");
+  if (show) {
+    inp.value = "New Conversation";
+    inp.focus();
+    inp.select();
+  }
+}
+
+async function submitNavNewChat() {
+  const inp = document.getElementById("navNewChatTitle");
+  const raw = inp ? inp.value.trim() : "";
+  const title = raw || "New Conversation";
+  showNavNewChatInline(false);
+  await createNewSession(title);
   closeNavDrawer();
+}
+
+function cancelNavNewChat() {
+  showNavNewChatInline(false);
+}
+
+function wireNavNewChatInline() {
+  const inp = document.getElementById("navNewChatTitle");
+  const createBtn = document.getElementById("navNewChatCreateBtn");
+  const cancelBtn = document.getElementById("navNewChatCancelBtn");
+  if (inp && !inp.dataset.newChatWired) {
+    inp.dataset.newChatWired = "1";
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submitNavNewChat();
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelNavNewChat();
+      }
+    });
+  }
+  if (createBtn && !createBtn.dataset.newChatWired) {
+    createBtn.dataset.newChatWired = "1";
+    createBtn.addEventListener("click", () => submitNavNewChat());
+  }
+  if (cancelBtn && !cancelBtn.dataset.newChatWired) {
+    cancelBtn.dataset.newChatWired = "1";
+    cancelBtn.addEventListener("click", () => cancelNavNewChat());
+  }
+}
+
+async function onNewChatClick() {
+  const row = document.getElementById("navNewChatRow");
+  const open = row && row.classList.contains("visible");
+  if (open) {
+    showNavNewChatInline(false);
+  } else {
+    showNavNewChatInline(true);
+  }
 }
 
 function syncBodyScrollLock(){
@@ -1450,15 +1526,15 @@ async function ensureChatSession() {
   return false;
 }
 
-async function createNewSession(){
-  const title = prompt("Chat name:", "New Conversation");
-  if(!title) return;
+async function createNewSession(title){
+  let t = typeof title === "string" ? title.trim() : "";
+  if (!t) t = "New Conversation";
 
   try {
     const response = await fetch(SERVER + "/session/new", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({title})
+      body: JSON.stringify({ title: t })
     });
 
     const data = await response.json();
@@ -2411,6 +2487,7 @@ function wireAuthModalControls() {
 window.addEventListener("load", () => {
   const inp = document.getElementById("userInput");
   wireAuthModalControls();
+  wireNavNewChatInline();
   if (inp) {
     inp.addEventListener("input", function resizeComposer() {
       this.style.height = "auto";
