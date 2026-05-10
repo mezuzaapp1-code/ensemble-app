@@ -16,6 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from ensemble_db import (
+    DB_LABEL,
     USE_POSTGRES,
     adapt as sqlq,
     connect_db,
@@ -724,6 +725,9 @@ def record_telemetry_run(
 
 init_db_tables()
 migrate_db_schema()
+print(
+    f"[ensemble] database: {'PostgreSQL' if USE_POSTGRES else 'SQLite'} — {DB_LABEL}"
+)
 
 # Sentinel: omit param to preserve DB value when calling save_profile
 _PROFILE_KEEP = object()
@@ -2357,6 +2361,15 @@ def billing_checkout_url():
     return {"url": STRIPE_CHECKOUT_URL}
 
 
+def trial_usage_identifier(session_id: str, profile: Optional[dict]) -> str:
+    """trial_usage.user_identifier must never be SQL NULL — use session_id when name missing."""
+    if profile:
+        name = profile.get("user_name")
+        if name is not None and str(name).strip():
+            return str(name).strip()
+    return (session_id or "").strip() or "anonymous"
+
+
 @app.post("/session/new")
 def create_new_session(req: NewSessionRequest):
     """Create a new conversation session"""
@@ -2400,7 +2413,7 @@ def get_session_history(session_id: str):
     messages = c.fetchall()
     prof = get_profile(session_id)
     # Get trial count
-    user_id = prof.get("user_name", "anonymous") if prof else "anonymous"
+    user_id = trial_usage_identifier(session_id, prof)
     xe(c, "SELECT trial_count FROM trial_usage WHERE user_identifier = ?", (user_id,))
     t_row = c.fetchone()
     trial_count = t_row[0] if t_row else 0
@@ -2622,7 +2635,7 @@ async def run_ensemble(req: RunRequest):
         tr_tok = _TIER_ROUTING_CTX.set(routing)
 
         profile = get_profile(req.session_id)
-        user_id = profile.get("user_name", "anonymous") if profile else "anonymous"
+        user_id = trial_usage_identifier(req.session_id, profile)
 
         xe(c, "SELECT trial_count, is_pro FROM trial_usage WHERE user_identifier = ?", (user_id,))
         row = c.fetchone()
@@ -3093,7 +3106,7 @@ async def run_ensemble_stream(req: RunRequest):
     record_user_ensemble_message(uid)
 
     profile = get_profile(req.session_id)
-    user_id = profile.get("user_name", "anonymous") if profile else "anonymous"
+    user_id = trial_usage_identifier(req.session_id, profile)
     conn_pre = connect_db()
     c_pre = conn_pre.cursor()
     xe(c_pre, "SELECT trial_count, is_pro FROM trial_usage WHERE user_identifier = ?", (user_id,))
