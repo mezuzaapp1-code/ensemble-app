@@ -18,7 +18,7 @@
   --text:#c8c8c8;
   --muted:#848484;
   --header-h:56px;
-  --drawer-w:min(296px,calc(100vw - 40px));
+  --sidebar-w:260px;
   --readable:#d4d4d4;
 }
 
@@ -34,9 +34,10 @@ body{
 
 /* —— Premium top header —— */
 .top-header{
-  position:fixed;top:0;left:0;right:0;
+  position:fixed;top:0;left:var(--main-offset);right:0;
   height:var(--header-h);
   z-index:200;
+  transition:left .28s cubic-bezier(.32,.72,0,1);
   display:flex;align-items:center;
   padding:0 clamp(14px,2.8vw,28px);
   background:rgba(9,9,9,.82);
@@ -101,33 +102,58 @@ body{
 
 .header-right{display:flex;justify-content:flex-end}
 
-/* Glass nav drawer + scrim */
+body{--main-offset:var(--sidebar-w)}
+body.sidebar-collapsed{--main-offset:0px}
+@media(max-width:767px){body{--main-offset:0px}}
+
 .sidebar-scrim{
-  position:fixed;inset:0;top:var(--header-h);
-  z-index:170;
-  background:rgba(0,0,0,.38);
+  position:fixed;inset:0;
+  z-index:205;
+  background:rgba(0,0,0,.42);
   backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px);
   opacity:0;visibility:hidden;transition:opacity .22s ease;pointer-events:none;
 }
-body.nav-drawer-open .sidebar-scrim{opacity:1;visibility:visible;pointer-events:auto}
-
-.nav-drawer{
-  position:fixed;top:var(--header-h);left:0;bottom:0;width:var(--drawer-w);
-  z-index:180;
-  transform:translateX(-103%);
-  transition:transform .3s cubic-bezier(.32,.72,0,1);
-  outline:none;
+@media(min-width:768px){.sidebar-scrim{display:none}}
+@media(max-width:767px){
+  body.sidebar-mobile-open .sidebar-scrim{opacity:1;visibility:visible;pointer-events:auto}
 }
-body.nav-drawer-open .nav-drawer{transform:translateX(0)}
+
+.nav-drawer.nav-sidebar,.nav-sidebar{
+  position:fixed;top:0;left:0;
+  width:var(--sidebar-w);min-width:var(--sidebar-w);
+  height:100vh;height:100dvh;
+  z-index:210;
+  transform:translateX(0);
+  transition:transform .28s cubic-bezier(.32,.72,0,1);
+  outline:none;
+  box-sizing:border-box;
+}
+@media(min-width:768px){
+  body.sidebar-collapsed .nav-drawer.nav-sidebar,
+  body.sidebar-collapsed .nav-sidebar{
+    transform:translateX(-100%);
+  }
+}
+@media(max-width:767px){
+  body:not(.sidebar-mobile-open) .nav-drawer.nav-sidebar,
+  body:not(.sidebar-mobile-open) .nav-sidebar{
+    transform:translateX(-100%);
+  }
+  body.sidebar-mobile-open .nav-drawer.nav-sidebar,
+  body.sidebar-mobile-open .nav-sidebar{
+    transform:translateX(0);
+    box-shadow:12px 0 40px rgba(0,0,0,.5);
+  }
+}
 
 .nav-drawer-inner{
   height:100%;
   display:flex;flex-direction:column;
-  background:rgba(10,10,10,.62);
-  backdrop-filter:blur(40px);-webkit-backdrop-filter:blur(40px);
+  background:var(--bg);
+  backdrop-filter:none;
   border-right:1px solid var(--border);
-  padding:18px clamp(14px,3vw,20px) 24px;
-  box-shadow:8px 0 48px rgba(0,0,0,.55);
+  padding:18px clamp(14px,3vw,18px) 24px 14px;
+  box-sizing:border-box;
 }
 
 .nav-drawer-head{
@@ -178,8 +204,11 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
 .session-item-title{font-weight:500;color:inherit}
 .session-item-time{font-size:10px;color:var(--muted);margin-top:4px;text-transform:uppercase;letter-spacing:.06em}
 
-/* Main stage — full viewport below header */
-.stage-wrap{padding-top:var(--header-h);height:100%;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+/* Main stage — full viewport below header; offset for persistent sidebar (desktop) */
+.stage-wrap{
+  margin-left:var(--main-offset);
+  transition:margin-left .28s cubic-bezier(.32,.72,0,1);
+  padding-top:var(--header-h);height:100%;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
 .main-content#mainContent{
   flex:1;
   min-height:0;
@@ -188,6 +217,7 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
   background:var(--bg);
 }
 .main-content,#mainContent{
+  margin-left:0;
   max-width:100%;
   width:100%;
 }
@@ -488,9 +518,14 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
   cursor:pointer;transition:background .17s,border-color .17s}
 .next-action-btn:hover{background:rgba(255,255,255,.11);border-color:#393939}
 
-.composer-shell{position:fixed;bottom:0;left:0;right:0;z-index:150;padding:0 clamp(18px,3.5vw,36px) 22px;pointer-events:none;max-width:900px;width:100%;margin:0 auto}
+.composer-shell{
+  position:fixed;bottom:0;left:var(--main-offset);right:0;z-index:150;
+  padding:0 clamp(18px,3.5vw,36px) 22px;pointer-events:none;
+  max-width:none;width:auto;margin:0;
+  transition:left .28s cubic-bezier(.32,.72,0,1);
+}
 .composer-shell > *{pointer-events:auto}
-.composer-dock{width:100%;max-width:52rem;margin:0 auto}
+.composer-dock{width:100%;max-width:900px;margin:0 auto}
 .composer-meta{
   display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:12px 20px;
   min-height:20px;margin-bottom:10px;text-align:center;
@@ -573,7 +608,7 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
         <span class="brand-text">BEN</span>
         <span class="brand-dot" aria-hidden="true"></span>
       </div>
-      <button type="button" class="btn-icon" id="navOpenBtn" onclick="openNavDrawer()" aria-label="Open conversations" title="Conversations">
+      <button type="button" class="btn-icon" id="navOpenBtn" onclick="toggleSidebar()" aria-label="Toggle sidebar" title="Toggle sidebar" aria-expanded="true">
         <i class="fa-solid fa-bars" aria-hidden="true"></i>
       </button>
     </div>
@@ -595,11 +630,11 @@ body.nav-drawer-open .nav-drawer{transform:translateX(0)}
 
 <div class="sidebar-scrim" id="sidebarScrim" onclick="closeNavDrawer()" aria-hidden="true"></div>
 
-<aside class="nav-drawer" id="navDrawer" aria-label="Conversations">
+<aside class="nav-drawer nav-sidebar" id="navDrawer" aria-label="Conversations">
   <div class="nav-drawer-inner">
     <div class="nav-drawer-head">
       <span class="nav-drawer-label">Conversations</span>
-      <button type="button" class="btn-icon btn-icon-tight" onclick="closeNavDrawer()" aria-label="Close menu" title="Close">
+      <button type="button" class="btn-icon btn-icon-tight" onclick="closeSidebarCompact()" aria-label="Collapse or close sidebar" title="Close">
         <i class="fa-solid fa-xmark" aria-hidden="true"></i>
       </button>
     </div>
@@ -1482,24 +1517,72 @@ async function onNewChatClick() {
   }
 }
 
+const sidebarMobileMq = window.matchMedia("(max-width: 767px)");
+
+function sidebarIsMobile() {
+  return sidebarMobileMq.matches;
+}
+
+function syncSidebarAria() {
+  const btn = document.getElementById("navOpenBtn");
+  const drawer = document.getElementById("navDrawer");
+  if (!btn || !drawer) return;
+  let open;
+  if (sidebarIsMobile()) {
+    open = document.body.classList.contains("sidebar-mobile-open");
+  } else {
+    open = !document.body.classList.contains("sidebar-collapsed");
+  }
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+  drawer.setAttribute("aria-hidden", open ? "false" : "true");
+}
+
 function syncBodyScrollLock(){
-  const nav = document.body.classList.contains("nav-drawer-open");
+  const navOverlay =
+    sidebarIsMobile() && document.body.classList.contains("sidebar-mobile-open");
   const pm = document.getElementById("profileModal");
   const tpm = document.getElementById("benToolPickerModal");
   const am = document.getElementById("authModal");
   const prof = pm && pm.classList.contains("visible");
   const pick = tpm && tpm.classList.contains("visible");
   const auth = am && am.classList.contains("visible");
-  document.body.style.overflow = nav || prof || pick || auth ? "hidden" : "";
+  document.body.style.overflow = navOverlay || prof || pick || auth ? "hidden" : "";
 }
 
-function openNavDrawer(){
-  document.body.classList.add("nav-drawer-open");
+function toggleSidebar() {
+  if (sidebarIsMobile()) {
+    document.body.classList.toggle("sidebar-mobile-open");
+  } else {
+    document.body.classList.toggle("sidebar-collapsed");
+  }
   syncBodyScrollLock();
+  syncSidebarAria();
 }
-function closeNavDrawer(){
-  document.body.classList.remove("nav-drawer-open");
+
+function closeNavDrawer() {
+  document.body.classList.remove("sidebar-mobile-open");
   syncBodyScrollLock();
+  syncSidebarAria();
+}
+
+function closeSidebarCompact() {
+  if (sidebarIsMobile()) {
+    closeNavDrawer();
+  } else {
+    document.body.classList.add("sidebar-collapsed");
+    syncBodyScrollLock();
+    syncSidebarAria();
+  }
+}
+
+function openNavDrawer() {
+  if (sidebarIsMobile()) {
+    document.body.classList.add("sidebar-mobile-open");
+  } else {
+    document.body.classList.remove("sidebar-collapsed");
+  }
+  syncBodyScrollLock();
+  syncSidebarAria();
 }
 
 // ========================
@@ -2484,10 +2567,17 @@ function wireAuthModalControls() {
   }
 }
 
+sidebarMobileMq.addEventListener("change", () => {
+  document.body.classList.remove("sidebar-mobile-open");
+  syncBodyScrollLock();
+  syncSidebarAria();
+});
+
 window.addEventListener("load", () => {
   const inp = document.getElementById("userInput");
   wireAuthModalControls();
   wireNavNewChatInline();
+  syncSidebarAria();
   if (inp) {
     inp.addEventListener("input", function resizeComposer() {
       this.style.height = "auto";
