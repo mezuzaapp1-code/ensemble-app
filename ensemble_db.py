@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -260,6 +262,44 @@ def _init_db_sqlite(conn: sqlite3.Connection) -> None:
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_user_ensemble_usage_uid_time ON user_ensemble_usage (user_id, used_at)"
     )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS threads (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_responses (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            content TEXT NOT NULL,
+            is_ben_synthesis INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ben_learning_events (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            source_response_id TEXT,
+            event_type TEXT NOT NULL,
+            payload TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_responses_tid_mid ON model_responses (thread_id, message_id)"
+    )
     conn.commit()
 
 
@@ -353,6 +393,36 @@ def _init_db_postgres(conn: Any) -> None:
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_user_ensemble_usage_uid_time ON user_ensemble_usage (user_id, used_at)",
+        """
+        CREATE TABLE IF NOT EXISTS threads (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS model_responses (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            content TEXT NOT NULL,
+            is_ben_synthesis BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS ben_learning_events (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            source_response_id TEXT,
+            event_type TEXT NOT NULL,
+            payload TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_model_responses_tid_mid ON model_responses (thread_id, message_id)",
     ]
     for s in stmts:
         c.execute(s)
@@ -496,6 +566,44 @@ def _migrate_sqlite(conn: sqlite3.Connection) -> None:
         )
     """
     )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS threads (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_responses (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            content TEXT NOT NULL,
+            is_ben_synthesis INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ben_learning_events (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            source_response_id TEXT,
+            event_type TEXT NOT NULL,
+            payload TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_responses_tid_mid ON model_responses (thread_id, message_id)"
+    )
     conn.commit()
 
 
@@ -574,4 +682,249 @@ def _migrate_postgres(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_user_ensemble_usage_uid_time ON user_ensemble_usage (user_id, used_at)"
     )
 
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS threads (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_responses (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            content TEXT NOT NULL,
+            is_ben_synthesis BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ben_learning_events (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            source_response_id TEXT,
+            event_type TEXT NOT NULL,
+            payload TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_responses_tid_mid ON model_responses (thread_id, message_id)"
+    )
+
     conn.commit()
+
+
+# --- BEN v3: thread model responses (append-only raw answers + BEN synthesis metadata) ---
+
+
+def create_thread(title: str | None = None) -> str:
+    """Create a thread row; returns new thread id."""
+    tid = str(uuid.uuid4())
+    conn = connect_db()
+    c = conn.cursor()
+    if USE_POSTGRES:
+        c.execute(
+            adapt(
+                "INSERT INTO threads (id, title, created_at, updated_at) VALUES (?, ?, NOW(), NOW())"
+            ),
+            (tid, title),
+        )
+    else:
+        c.execute(
+            adapt(
+                "INSERT INTO threads (id, title, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))"
+            ),
+            (tid, title),
+        )
+    conn.commit()
+    conn.close()
+    return tid
+
+
+def ensure_thread_row(thread_id: str, title: str | None = None) -> None:
+    """Insert a threads row if missing (session may predate the threads table)."""
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute(adapt("SELECT 1 FROM threads WHERE id = ?"), (thread_id,))
+    if c.fetchone():
+        conn.close()
+        return
+    if USE_POSTGRES:
+        c.execute(
+            adapt(
+                "INSERT INTO threads (id, title, created_at, updated_at) VALUES (?, ?, NOW(), NOW())"
+            ),
+            (thread_id, title),
+        )
+    else:
+        c.execute(
+            adapt(
+                "INSERT INTO threads (id, title, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))"
+            ),
+            (thread_id, title),
+        )
+    conn.commit()
+    conn.close()
+
+
+def touch_thread(thread_id: str) -> None:
+    conn = connect_db()
+    c = conn.cursor()
+    if USE_POSTGRES:
+        c.execute(adapt("UPDATE threads SET updated_at = NOW() WHERE id = ?"), (thread_id,))
+    else:
+        c.execute(
+            adapt("UPDATE threads SET updated_at = datetime('now') WHERE id = ?"),
+            (thread_id,),
+        )
+    conn.commit()
+    conn.close()
+
+
+def save_model_response(
+    thread_id: str,
+    message_id: str,
+    model: str,
+    content: str,
+    *,
+    is_ben_synthesis: bool = False,
+) -> str:
+    """
+    Raw model responses are append-only.
+    Never UPDATE or DELETE existing model outputs.
+    """
+    rid = str(uuid.uuid4())
+    conn = connect_db()
+    c = conn.cursor()
+    if USE_POSTGRES:
+        c.execute(
+            adapt(
+                "INSERT INTO model_responses (id, thread_id, message_id, model, content, is_ben_synthesis) "
+                "VALUES (?, ?, ?, ?, ?, ?)"
+            ),
+            (rid, thread_id, message_id, model, content, is_ben_synthesis),
+        )
+    else:
+        c.execute(
+            adapt(
+                "INSERT INTO model_responses (id, thread_id, message_id, model, content, is_ben_synthesis) "
+                "VALUES (?, ?, ?, ?, ?, ?)"
+            ),
+            (rid, thread_id, message_id, model, content, 1 if is_ben_synthesis else 0),
+        )
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def load_model_responses(thread_id: str, message_id: str) -> list[dict[str, Any]]:
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute(
+        adapt(
+            "SELECT id, model, content, is_ben_synthesis, created_at FROM model_responses "
+            "WHERE thread_id = ? AND message_id = ? ORDER BY created_at ASC"
+        ),
+        (thread_id, message_id),
+    )
+    rows = c.fetchall()
+    conn.close()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r[0],
+                "model": r[1],
+                "content": r[2],
+                "is_ben_synthesis": bool(r[3]),
+                "created_at": r[4],
+            }
+        )
+    return out
+
+
+def load_last_user_message(thread_id: str) -> str:
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute(
+        adapt(
+            "SELECT content FROM messages WHERE session_id = ? AND role = 'user' "
+            "ORDER BY id DESC LIMIT 1"
+        ),
+        (thread_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    return (row[0] or "") if row else ""
+
+
+def load_last_user_message_id(thread_id: str) -> str:
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute(
+        adapt(
+            "SELECT id FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1"
+        ),
+        (thread_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    return str(row[0]) if row else ""
+
+
+def save_learning_event(
+    thread_id: str,
+    event_type: str,
+    source_response_id: Optional[str] = None,
+    payload: Optional[str] = None,
+) -> str:
+    eid = str(uuid.uuid4())
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute(
+        adapt(
+            "INSERT INTO ben_learning_events (id, thread_id, source_response_id, event_type, payload) "
+            "VALUES (?, ?, ?, ?, ?)"
+        ),
+        (eid, thread_id, source_response_id, event_type, payload),
+    )
+    conn.commit()
+    conn.close()
+    return eid
+
+
+def insert_message_return_id(session_id: str, model: str, role: str, content: str) -> str:
+    conn = connect_db()
+    c = conn.cursor()
+    ts = datetime.now().isoformat()
+    if USE_POSTGRES:
+        c.execute(
+            adapt(
+                "INSERT INTO messages (session_id, model, role, content, timestamp) "
+                "VALUES (?, ?, ?, ?, ?) RETURNING id"
+            ),
+            (session_id, model, role, content, ts),
+        )
+        row = c.fetchone()
+        mid = str(row[0]) if row else ""
+    else:
+        c.execute(
+            adapt(
+                "INSERT INTO messages (session_id, model, role, content, timestamp) VALUES (?, ?, ?, ?, ?)"
+            ),
+            (session_id, model, role, content, ts),
+        )
+        mid = str(c.lastrowid)
+    conn.commit()
+    conn.close()
+    return mid

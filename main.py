@@ -20,11 +20,20 @@ from ensemble_db import (
     USE_POSTGRES,
     adapt as sqlq,
     connect_db,
-    is_unique_violation,
+    create_thread,
+    ensure_thread_row,
     init_db_tables,
+    insert_message_return_id,
+    is_unique_violation,
+    load_last_user_message,
+    load_last_user_message_id,
+    load_model_responses,
     migrate_schema as migrate_db_schema,
     now_expr_insert,
+    save_learning_event,
+    save_model_response,
     SQLITE_DB_PATH,
+    touch_thread,
 )
 import bcrypt
 import jwt
@@ -77,6 +86,8 @@ CLAUDE_FALLBACK_MODELS = [m for m in MODEL_REGISTRY["claude_fallback_chain"] if 
 GEMINI_FALLBACK_MODELS = list(MODEL_REGISTRY["gemini_fallback_chain"])
 
 FREE_USER_LIMIT = max(0, int(os.getenv("FREE_USER_LIMIT", "5") or "5"))
+
+CHAT_MODEL_KEYS = frozenset({"gpt", "gpt-fast", "gemini", "gemini-fast", "claude"})
 
 _TIER_ROUTING_CTX: ContextVar[Optional["TierRouting"]] = ContextVar("_tier_routing_ctx", default=None)
 
@@ -145,6 +156,44 @@ def effective_claude_fallbacks_for_call() -> tuple[str, ...]:
     if tr:
         return tr.claude_fallbacks
     return tuple(CLAUDE_FALLBACK_MODELS)
+
+
+async def _run_with_routing(routing: TierRouting, coro: Any):
+    tok = _TIER_ROUTING_CTX.set(routing)
+    try:
+        return await coro
+    finally:
+        _TIER_ROUTING_CTX.reset(tok)
+
+
+def _stored_label_for_model_key(model_key: str) -> str:
+    mk = (model_key or "").strip().lower()
+    if mk == "gpt":
+        return effective_openai_default()
+    if mk == "gpt-fast":
+        return effective_openai_default("gpt-fast")
+    if mk in ("gemini", "gemini-fast"):
+        return effective_gemini_default()
+    if mk == "claude":
+        return effective_claude_primary() or CLAUDE_MODEL
+    return mk
+
+
+def _ben_placeholder_mixed_failure_success(texts: list[str]) -> bool:
+    if len(texts) < 2:
+        return False
+
+    def _failed(t: str) -> bool:
+        x = (t or "").lower()
+        return (
+            " error:" in x
+            or x.startswith("gpt error")
+            or x.startswith("claude error")
+            or x.startswith("gemini error")
+        )
+
+    flags = [_failed(t) for t in texts]
+    return any(flags) and not all(flags)
 
 
 def _gemini_candidate_models(primary: str) -> list[str]:
@@ -750,6 +799,21 @@ class RunRequest(BaseModel):
     question: str
     web_search: Optional[bool] = False
 
+
+class ChatRequest(BaseModel):
+    """Fast single-model chat (BEN v3); thread_id optional — server creates one when absent."""
+    thread_id: Optional[str] = None
+    title: Optional[str] = None
+    message: str
+    model: str = "gpt"
+
+
+class AddAIRequest(BaseModel):
+    """Append another model answer for the latest user turn in the thread."""
+    thread_id: str
+    model: str = "gpt"
+
+
 class TestAIRequest(BaseModel):
     prompt: str = "Reply with one short sentence: backend connectivity test passed."
 
@@ -1176,6 +1240,84 @@ def update_session_timestamp(session_id):
     """, (datetime.now().isoformat(), session_id))
     conn.commit()
     conn.close()
+
+
+def ensure_session_exists(session_id: str, title: str = "Conversation") -> None:
+    """Insert sessions row if missing (mirrors create_session without overwriting)."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return
+    conn = connect_db()
+    c = conn.cursor()
+    xe(c, "SELECT 1 FROM sessions WHERE session_id = ?", (sid,))
+    if c.fetchone():
+        conn.close()
+        return
+    now = datetime.now().isoformat()
+    xe(c, """
+        INSERT INTO sessions (session_id, created_at, updated_at, title)
+        VALUES (?, ?, ?, ?)
+    """, (sid, now, now, title))
+    conn.commit()
+    conn.close()
+
+
+def _resolve_trial_is_pro(session_id: str) -> bool:
+    profile = get_profile(session_id)
+    user_id = trial_usage_identifier(session_id, profile)
+    conn_pre = connect_db()
+    c_pre = conn_pre.cursor()
+    xe(c_pre, "SELECT trial_count, is_pro FROM trial_usage WHERE user_identifier = ?", (user_id,))
+    row_pre = c_pre.fetchone()
+    if not row_pre:
+        xe(c_pre, "INSERT INTO trial_usage (user_identifier, trial_count) VALUES (?, 0)", (user_id,))
+        conn_pre.commit()
+        conn_pre.close()
+        return False
+    is_pro_pre = int(row_pre[1] or 0)
+    conn_pre.close()
+    return bool(is_pro_pre)
+
+
+async def ben_learn_after_response(thread_id: str, message_id: str, response_id: str):
+    """Background learning hook; never blocks chat streaming."""
+    try:
+        rows = load_model_responses(thread_id, message_id)
+        raw_texts = [r["content"] for r in rows if not r.get("is_ben_synthesis")]
+        if len(raw_texts) < 2:
+            return
+        if _ben_placeholder_mixed_failure_success(raw_texts):
+            save_learning_event(
+                thread_id,
+                "conflict_placeholder",
+                source_response_id=response_id,
+                payload=json.dumps({"signal": "mixed_failure_success"}),
+            )
+    except Exception as e:
+        print(f"[ben_learn_after_response] {e}")
+
+
+async def ben_synthesize(thread_id: str, message_id: str, responses: list):
+    """Persist BEN synthesis as append-only model_responses row (model key ben)."""
+    try:
+        raw = [r for r in responses if not r.get("is_ben_synthesis")]
+        if len(raw) < 2:
+            return
+        body = "\n\n".join(f"--- {r['model']} ---\n{r['content']}" for r in raw)
+        prompt = (
+            "You are BEN. Synthesize the analyst responses below into one coherent English answer. "
+            "Use clear structure.\n\n"
+            + body
+        )
+        tr = current_tier_routing()
+        if tr and not tr.ben_use_claude:
+            text = await ask_gpt(prompt, session_id=thread_id, model=tr.openai_main)
+        else:
+            text = await ask_claude(prompt, session_id=thread_id)
+        save_model_response(thread_id, message_id, "ben", text, is_ben_synthesis=True)
+        touch_thread(thread_id)
+    except Exception as e:
+        print(f"[ben_synthesize] {e}")
 
 # ========================
 # AI MODEL FUNCTIONS
@@ -3071,6 +3213,125 @@ async def credit_check():
     """Run provider readiness/budget probe on demand."""
     checks = await run_credit_probe(emit_logs=True)
     return {"success": True, "checks": checks}
+
+
+@app.post("/api/chat")
+async def api_chat(req: ChatRequest):
+    """
+    Fast path:
+    user -> one selected model -> stream -> save full response at end.
+    No consensus, no ranking, no synthesis during stream.
+    """
+    uid = get_or_create_guest_ensemble_user_id()
+    db_tier, _ = fetch_user_account(uid)
+    routing = routing_for_db_tier(db_tier)
+    if routing.tier != "pro" and not DEV_MODE:
+        if count_user_ensemble_usage_24h(uid) >= FREE_USER_LIMIT:
+            raise HTTPException(status_code=403, detail={"error": "LIMIT_REACHED"})
+    record_user_ensemble_message(uid)
+
+    msg = (req.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="message is required")
+    mk = (req.model or "gpt").strip().lower()
+    if mk not in CHAT_MODEL_KEYS:
+        raise HTTPException(status_code=400, detail="invalid model")
+    if routing.tier != "pro" and mk == "claude":
+        raise HTTPException(status_code=403, detail="Claude is available on Pro tier")
+
+    title = (req.title or "").strip() or "Conversation"
+    if req.thread_id and str(req.thread_id).strip():
+        tid = str(req.thread_id).strip()
+        ensure_thread_row(tid, title)
+        ensure_session_exists(tid, title)
+    else:
+        tid = create_thread(title)
+        create_session(tid, title)
+
+    is_pro = _resolve_trial_is_pro(tid)
+    enforce_ensemble_rate_limit(tid, is_pro)
+
+    async def gen():
+        tr_token = _TIER_ROUTING_CTX.set(routing)
+        try:
+            message_id = insert_message_return_id(tid, "chat", "user", msg)
+            parts: list[str] = []
+            async for piece in stream_round1_model(mk, msg, tid):
+                parts.append(piece)
+                yield f"data: {json.dumps({'type': 'chunk', 'content': piece})}\n\n"
+            full = "".join(parts)
+            label = _stored_label_for_model_key(mk)
+            rid = save_model_response(tid, message_id, label, full, is_ben_synthesis=False)
+            touch_thread(tid)
+            update_session_timestamp(tid)
+            yield f"data: {json.dumps({'type': 'done', 'thread_id': tid, 'message_id': message_id, 'response_id': rid, 'model': label})}\n\n"
+            asyncio.create_task(_run_with_routing(routing, ben_learn_after_response(tid, message_id, rid)))
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+        finally:
+            _TIER_ROUTING_CTX.reset(tr_token)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/thread/add-ai")
+async def add_ai_to_thread(req: AddAIRequest):
+    """Add another model answer to the same thread; never overwrites existing answers."""
+    uid = get_or_create_guest_ensemble_user_id()
+    db_tier, _ = fetch_user_account(uid)
+    routing = routing_for_db_tier(db_tier)
+    if routing.tier != "pro" and not DEV_MODE:
+        if count_user_ensemble_usage_24h(uid) >= FREE_USER_LIMIT:
+            raise HTTPException(status_code=403, detail={"error": "LIMIT_REACHED"})
+    record_user_ensemble_message(uid)
+
+    tid = (req.thread_id or "").strip()
+    if not tid:
+        raise HTTPException(status_code=400, detail="thread_id is required")
+
+    ensure_thread_row(tid)
+    ensure_session_exists(tid)
+
+    user_message = load_last_user_message(tid).strip()
+    if not user_message:
+        raise HTTPException(status_code=400, detail="no user message in thread")
+    message_id = load_last_user_message_id(tid)
+    if not message_id:
+        raise HTTPException(status_code=400, detail="no user message in thread")
+
+    mk = (req.model or "gpt").strip().lower()
+    if mk not in CHAT_MODEL_KEYS:
+        raise HTTPException(status_code=400, detail="invalid model")
+    if routing.tier != "pro" and mk == "claude":
+        raise HTTPException(status_code=403, detail="Claude is available on Pro tier")
+
+    is_pro = _resolve_trial_is_pro(tid)
+    enforce_ensemble_rate_limit(tid, is_pro)
+
+    async def gen():
+        tr_token = _TIER_ROUTING_CTX.set(routing)
+        try:
+            parts: list[str] = []
+            async for piece in stream_round1_model(mk, user_message, tid):
+                parts.append(piece)
+                yield f"data: {json.dumps({'type': 'chunk', 'content': piece})}\n\n"
+            full = "".join(parts)
+            label = _stored_label_for_model_key(mk)
+            rid = save_model_response(tid, message_id, label, full, is_ben_synthesis=False)
+            touch_thread(tid)
+            update_session_timestamp(tid)
+            yield f"data: {json.dumps({'type': 'done', 'thread_id': tid, 'message_id': message_id, 'response_id': rid, 'model': label})}\n\n"
+            responses = load_model_responses(tid, message_id)
+            raw_n = len([r for r in responses if not r["is_ben_synthesis"]])
+            if raw_n >= 2:
+                asyncio.create_task(_run_with_routing(routing, ben_synthesize(tid, message_id, responses)))
+            asyncio.create_task(_run_with_routing(routing, ben_learn_after_response(tid, message_id, rid)))
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+        finally:
+            _TIER_ROUTING_CTX.reset(tr_token)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.post("/tools/similar-ai")
