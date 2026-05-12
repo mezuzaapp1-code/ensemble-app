@@ -18,6 +18,7 @@
   --text:#c8c8c8;
   --muted:#848484;
   --header-h:56px;
+  /* BEN v3: persistent 260px left rail — offsets in --main-offset; see CODE_MAP.md */
   --sidebar-w:260px;
   --readable:#d4d4d4;
 }
@@ -105,6 +106,35 @@ body{
 body{--main-offset:var(--sidebar-w)}
 body.sidebar-collapsed{--main-offset:0px}
 @media(max-width:767px){body{--main-offset:0px}}
+
+@media(min-width:768px){
+  body.sidebar-collapsed .nav-drawer.nav-sidebar,
+  body.sidebar-collapsed .nav-sidebar{
+    transform:translateX(0)!important;
+  }
+  body.sidebar-collapsed{
+    --main-offset:var(--sidebar-w)!important;
+  }
+}
+
+.ensemble-card-slot{
+  display:flex;flex-direction:column;gap:8px;min-width:0;
+}
+.ensemble-static-slot{display:flex;flex-direction:column;gap:8px;min-width:0}
+
+.add-ai-bar{
+  display:flex;flex-wrap:wrap;gap:6px;padding:4px 0 10px;
+}
+.add-ai-bar button{
+  font:inherit;font-size:11px;font-weight:600;padding:6px 10px;border-radius:9px;
+  border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--readable);
+  cursor:pointer;transition:background .15s,border-color .15s;
+}
+.add-ai-bar button:hover{background:rgba(255,255,255,.1);border-color:#404040;color:var(--title)}
+.add-ai-stream-card{margin-top:12px;padding:14px;border:1px solid var(--border);border-radius:14px;background:rgba(255,255,255,.03)}
+.add-ai-stream-card .add-ai-stream-head{font-size:12px;font-weight:700;color:var(--muted);margin-bottom:8px}
+.pill-choice,.pill-choice-use{font:inherit;font-size:12px;padding:8px 12px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--readable);cursor:pointer}
+.pill-choice.on,.pill-choice-use.on{border-color:var(--title);background:rgba(255,255,255,.1);color:var(--title)}
 
 .sidebar-scrim{
   position:fixed;inset:0;
@@ -692,6 +722,49 @@ body.sidebar-collapsed{--main-offset:0px}
   </div>
 </div>
 
+<div class="panel-backdrop" id="onboardingModal" role="presentation">
+  <div class="profile-modal-card" onclick="event.stopPropagation()" style="max-width:440px">
+    <h2>Welcome</h2>
+    <p style="margin-bottom:16px;line-height:1.55;color:var(--muted);font-size:14px;">
+      Answer a few questions once. Date of birth is stored encrypted for personalization only.</p>
+
+    <div class="profile-field">
+      <label for="onboardingName">What is your name?</label>
+      <input id="onboardingName" type="text" placeholder="Your name" autocomplete="name" />
+    </div>
+    <div class="profile-field">
+      <label for="onboardingDob">Date of birth?</label>
+      <input id="onboardingDob" type="date" />
+    </div>
+    <div class="profile-field">
+      <label>Preferred language</label>
+      <div id="onboardingLangRow" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
+        <button type="button" class="pill-choice" data-lang="auto">Auto</button>
+        <button type="button" class="pill-choice" data-lang="en">English</button>
+        <button type="button" class="pill-choice" data-lang="he">Hebrew</button>
+        <button type="button" class="pill-choice" data-lang="ar">Arabic</button>
+        <button type="button" class="pill-choice" data-lang="ru">Russian</button>
+        <button type="button" class="pill-choice" data-lang="other">Other</button>
+      </div>
+      <input type="hidden" id="onboardingLang" value="auto" />
+    </div>
+    <div class="profile-field">
+      <label>How do you use AI?</label>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
+        <button type="button" class="pill-choice-use" data-use="work">Work</button>
+        <button type="button" class="pill-choice-use" data-use="learning">Learning</button>
+        <button type="button" class="pill-choice-use" data-use="coding">Coding</button>
+        <button type="button" class="pill-choice-use" data-use="research">Research</button>
+        <button type="button" class="pill-choice-use" data-use="personal">Personal</button>
+      </div>
+      <input type="hidden" id="onboardingUsage" value="" />
+    </div>
+    <div class="profile-actions">
+      <button type="button" class="save-btn" onclick="submitOnboarding()" title="Continue">Continue</button>
+    </div>
+  </div>
+</div>
+
 <div class="panel-backdrop" id="authModal" onclick="if(event.target===this) hideAuthModal()" role="presentation">
   <div class="profile-modal-card" onclick="event.stopPropagation()">
     <button type="button" class="panel-close profile-modal-close" onclick="hideAuthModal()" aria-label="Close">
@@ -982,6 +1055,8 @@ window.loginUser = async function loginUser() {
 window.submitAuthLogin = window.loginUser;
 
 let currentSession = null;
+let currentMessageId = "";
+let currentThreadId = "";
 let currentProfile = null;
 
 /** Client-side JWT shape/exp check (same secret not verified; server rejects bad tokens on API calls). */
@@ -1185,6 +1260,8 @@ const META = {
   'gemini-fast':{label:"Gemini Flash", color:"#8b5cf6", emoji:"✨"}
 };
 
+const ADD_META = { gpt: "GPT", gemini: "Gemini", claude: "Claude", ben: "BEN Synthesis" };
+
 let webSearchActive = false;
 let isSending = false;
 let moneySavedTotal = 0;
@@ -1377,6 +1454,9 @@ function mountLiveStreamShell(group){
 
   ["gpt","gemini","claude"].forEach(mid => {
     const meta = META[mid];
+    const slot = document.createElement("div");
+    slot.className = "ensemble-card-slot";
+    slot.dataset.modelSlot = mid;
     const card = document.createElement("div");
     card.className = "stream-model-card thinking";
     card.dataset.model = mid;
@@ -1387,7 +1467,17 @@ function mountLiveStreamShell(group){
         <span class="sm-status">Online</span>
       </div>
       <div class="sm-body">Thinking…</div>`;
-    grid.appendChild(card);
+    slot.appendChild(card);
+    const bar = document.createElement("div");
+    bar.className = "add-ai-bar";
+    bar.hidden = true;
+    bar.innerHTML = `
+      <button type="button" onclick="addAI('gpt')">+ GPT</button>
+      <button type="button" onclick="addAI('claude')">+ Claude</button>
+      <button type="button" onclick="addAI('gemini')">+ Gemini</button>
+      <button type="button" onclick="addAI('ben')">+ BEN Synthesis</button>`;
+    slot.appendChild(bar);
+    grid.appendChild(slot);
   });
   group.appendChild(grid);
 
@@ -1404,7 +1494,30 @@ function mountLiveStreamShell(group){
     <div class="message assistant ben-stream-body" id="liveBenBody"></div>`;
   group.appendChild(benWrap);
 
+  const benBar = document.createElement("div");
+  benBar.className = "add-ai-bar ben-add-ai-bar";
+  benBar.hidden = true;
+  benBar.innerHTML = `
+    <button type="button" onclick="addAI('gpt')">+ GPT</button>
+    <button type="button" onclick="addAI('claude')">+ Claude</button>
+    <button type="button" onclick="addAI('gemini')">+ Gemini</button>
+    <button type="button" onclick="addAI('ben')">+ BEN Synthesis</button>`;
+  group.appendChild(benBar);
+
   group._liveBuf = { gpt:"", gemini:"", claude:"" };
+}
+
+function showAddAiBarForModel(group, modelKey){
+  const slot = group.querySelector(`.ensemble-card-slot[data-model-slot="${modelKey}"]`);
+  const bar = slot && slot.querySelector(".add-ai-bar");
+  if(bar) bar.hidden = false;
+}
+
+function revealAllAddAiBars(group){
+  if(!group) return;
+  group.querySelectorAll(".ensemble-card-slot .add-ai-bar").forEach(b => { b.hidden = false; });
+  const bb = group.querySelector(".ben-add-ai-bar");
+  if(bb) bb.hidden = false;
 }
 
 function showTokenSaverBanner(group, message){
@@ -1508,13 +1621,8 @@ function wireNavNewChatInline() {
 }
 
 async function onNewChatClick() {
-  const row = document.getElementById("navNewChatRow");
-  const open = row && row.classList.contains("visible");
-  if (open) {
-    showNavNewChatInline(false);
-  } else {
-    showNavNewChatInline(true);
-  }
+  await createNewSession("New Conversation");
+  closeNavDrawer();
 }
 
 const sidebarMobileMq = window.matchMedia("(max-width: 767px)");
@@ -1543,10 +1651,12 @@ function syncBodyScrollLock(){
   const pm = document.getElementById("profileModal");
   const tpm = document.getElementById("benToolPickerModal");
   const am = document.getElementById("authModal");
+  const ob = document.getElementById("onboardingModal");
   const prof = pm && pm.classList.contains("visible");
   const pick = tpm && tpm.classList.contains("visible");
   const auth = am && am.classList.contains("visible");
-  document.body.style.overflow = navOverlay || prof || pick || auth ? "hidden" : "";
+  const onb = ob && ob.classList.contains("visible");
+  document.body.style.overflow = navOverlay || prof || pick || auth || onb ? "hidden" : "";
 }
 
 function toggleSidebar() {
@@ -1600,6 +1710,7 @@ async function ensureChatSession() {
     const data = await response.json();
     if (data.success) {
       currentSession = data.session_id;
+      currentThreadId = data.session_id;
       persistPreferredSessionId(currentSession);
       return true;
     }
@@ -1623,6 +1734,7 @@ async function createNewSession(title){
     const data = await response.json();
     if(data.success){
       currentSession = data.session_id;
+      currentThreadId = data.session_id;
       persistPreferredSessionId(currentSession);
       loadSessions();
       loadChatHistory();
@@ -1730,7 +1842,7 @@ async function loadSessions(){
         <div class="session-item ${s.session_id === currentSession ? 'active' : ''}" 
              onclick="switchSession('${s.session_id}')">
           <div class="session-item-title">${escapeHtml(s.title)}</div>
-          <div class="session-item-time">${new Date(s.updated_at).toLocaleDateString()}</div>
+          <div class="session-item-time">${s.updated_at ? new Date(s.updated_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : ""}</div>
         </div>
       `).join("");
 
@@ -1738,6 +1850,7 @@ async function loadSessions(){
         const pref = readPreferredSessionId();
         const match = pref && data.sessions.some(s => s.session_id === pref);
         currentSession = match ? pref : data.sessions[0].session_id;
+        currentThreadId = currentSession;
       }
       if (currentSession) persistPreferredSessionId(currentSession);
 
@@ -1761,6 +1874,7 @@ async function loadSessions(){
 
 async function switchSession(sessionId){
   currentSession = sessionId;
+  currentThreadId = sessionId;
   persistPreferredSessionId(sessionId);
   closeNavDrawer();
   showWelcomeScreen(false);
@@ -1816,6 +1930,16 @@ async function loadChatHistory(){
       });
 
       chat.scrollTop = chat.scrollHeight;
+
+      for(let i = data.messages.length - 1; i >= 0; i--){
+        const m = data.messages[i];
+        if(m.role === "user" && m.id != null && m.id !== undefined){
+          currentMessageId = String(m.id);
+          break;
+        }
+      }
+      currentThreadId = currentSession;
+      maybeShowOnboarding();
     }
   } catch(err) {
     console.error("Error loading chat history:", err);
@@ -2151,6 +2275,7 @@ function cardHtml(model, text, category){
     : '<span class="card-status online">Online</span>';
   const catParam = category ? `'${category}'` : "'technical'";
   return `
+    <div class="ensemble-static-slot">
     <div class="card">
       <div class="card-top">
         <div class="icon" style="background:${m.color}22">${m.emoji}</div>
@@ -2164,7 +2289,168 @@ function cardHtml(model, text, category){
       </div>
       <div class="card-body">${safeText}</div>
     </div>
+    <div class="add-ai-bar">
+      <button type="button" onclick="addAI('gpt')">+ GPT</button>
+      <button type="button" onclick="addAI('claude')">+ Claude</button>
+      <button type="button" onclick="addAI('gemini')">+ Gemini</button>
+      <button type="button" onclick="addAI('ben')">+ BEN Synthesis</button>
+    </div>
+    </div>
   `;
+}
+
+function maybeShowOnboarding(){
+  if(!currentSession) return;
+  if(currentProfile && currentProfile.onboarding_completed) return;
+  const om = document.getElementById("onboardingModal");
+  if(!om) return;
+  om.classList.add("visible");
+  syncBodyScrollLock();
+}
+
+function wireOnboardingPills(){
+  const langHidden = document.getElementById("onboardingLang");
+  document.querySelectorAll("#onboardingLangRow .pill-choice").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#onboardingLangRow .pill-choice").forEach(b => b.classList.remove("on"));
+      btn.classList.add("on");
+      if(langHidden) langHidden.value = btn.getAttribute("data-lang") || "auto";
+    });
+  });
+  const firstLang = document.querySelector('#onboardingLangRow .pill-choice[data-lang="auto"]');
+  if(firstLang){ firstLang.classList.add("on"); }
+
+  const useHidden = document.getElementById("onboardingUsage");
+  document.querySelectorAll(".pill-choice-use").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".pill-choice-use").forEach(b => b.classList.remove("on"));
+      btn.classList.add("on");
+      if(useHidden) useHidden.value = btn.getAttribute("data-use") || "";
+    });
+  });
+}
+
+async function submitOnboarding(){
+  const name = document.getElementById("onboardingName").value.trim();
+  if(!name){
+    updateStatus("Please enter your name.", true);
+    return;
+  }
+  if(!currentSession){
+    await ensureChatSession();
+  }
+  if(!currentSession){
+    updateStatus("Could not start a session.", true);
+    return;
+  }
+  const dob = document.getElementById("onboardingDob").value || "";
+  const lang = document.getElementById("onboardingLang").value || "auto";
+  const usage = document.getElementById("onboardingUsage").value || "personal";
+  try{
+    const r = await fetch(SERVER + `/session/${currentSession}/profile`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        user_name: name,
+        user_role: "other",
+        preferred_language: lang,
+        ai_usage_category: usage,
+        date_of_birth: dob,
+        onboarding_completed: true
+      })
+    });
+    const data = await r.json();
+    if(data.success){
+      currentProfile = data.profile;
+      updateProfileGreeting(currentProfile);
+      document.getElementById("onboardingModal").classList.remove("visible");
+      syncBodyScrollLock();
+      updateStatus("Preferences saved.");
+    } else {
+      updateStatus(data.error || "Could not save.", true);
+    }
+  }catch(e){
+    updateStatus(e.message, true);
+  }
+}
+
+async function addAI(modelKey){
+  const mk = String(modelKey || "").toLowerCase();
+  if(!currentSession){
+    updateStatus("No active chat.", true);
+    return;
+  }
+  const mid = currentMessageId;
+  if(!mid){
+    updateStatus("Send a message first.", true);
+    return;
+  }
+  updateStatus("Adding " + (ADD_META[mk] || mk) + "…");
+  const chat = document.getElementById("chatArea");
+  const wrap = document.createElement("div");
+  wrap.className = "message-group add-ai-followup";
+  wrap.innerHTML = `<div class="add-ai-stream-card"><div class="add-ai-stream-head">${escapeHtml(ADD_META[mk] || mk)}</div><div class="add-ai-stream-body"></div></div>`;
+  chat.appendChild(wrap);
+  const bodyEl = wrap.querySelector(".add-ai-stream-body");
+  try{
+    const response = await fetch(SERVER + "/api/thread/add-ai", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        thread_id: currentSession,
+        source_message_id: mid,
+        model: mk
+      })
+    });
+    if(response.status === 403){
+      updateStatus("Limit reached.", true);
+      wrap.remove();
+      return;
+    }
+    if(!response.ok){
+      const t = await response.text();
+      updateStatus("Add AI failed.", true);
+      wrap.remove();
+      return;
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let partial = "";
+    let buf = "";
+    while(true){
+      const { value, done } = await reader.read();
+      if(done) break;
+      partial += decoder.decode(value, { stream: true });
+      const lines = partial.split("\n");
+      partial = lines.pop() || "";
+      for(const line of lines){
+        if(!line.trim()) continue;
+        try{
+          const payload = line.startsWith("data:") ? line.slice(5).trimStart() : line;
+          const data = JSON.parse(payload);
+          if(data.type === "chunk"){
+            buf += data.content || "";
+          }
+          if(data.type === "error"){
+            bodyEl.textContent = data.content || "Error";
+            updateStatus(data.content || "Error", true);
+          }
+        }catch(_p){}
+      }
+      try{
+        bodyEl.innerHTML = marked.parse(buf);
+      }catch(_e){
+        bodyEl.textContent = buf;
+      }
+      chat.scrollTop = chat.scrollHeight;
+    }
+    updateStatus("Ready");
+    loadSessions();
+  }catch(err){
+    console.error(err);
+    updateStatus(err.message, true);
+    wrap.remove();
+  }
 }
 
 // ========================
@@ -2305,6 +2591,11 @@ async function sendMessage(){
             resetPipelineBar();
             continue;
           }
+          if (data.type === "user_turn") {
+            currentMessageId = String(data.message_id || "");
+            currentThreadId = String(data.thread_id || currentSession || "");
+            continue;
+          }
           if (data.type === "pipeline") {
             setPipelineBar(typeof data.step === "number" ? data.step : 0, data.label);
             continue;
@@ -2348,6 +2639,7 @@ async function sendMessage(){
           if (data.type === "round1_complete") {
             const card = group.querySelector(`.stream-model-card[data-model="${data.model}"]`);
             if(card) card.classList.add("done");
+            showAddAiBarForModel(group, data.model);
             continue;
           }
           if (data.type === "ben_reset") {
@@ -2591,6 +2883,7 @@ window.addEventListener("load", () => {
     });
   }
   refreshAuthBadge();
+  wireOnboardingPills();
   loadSessions();
 });
 
@@ -2652,6 +2945,11 @@ document.addEventListener("keydown", (e) => {
     if(am && am.classList.contains("visible")) hideAuthModal();
     const lm = document.getElementById("limit-tier-modal");
     if(lm && lm.classList.contains("visible")) closeLimitTierModal();
+    const ob = document.getElementById("onboardingModal");
+    if(ob && ob.classList.contains("visible")){
+      ob.classList.remove("visible");
+      syncBodyScrollLock();
+    }
     return;
   }
 });

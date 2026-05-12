@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .gemini/
 *.log
+CODE_MAP.md
+venv311/

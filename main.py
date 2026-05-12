@@ -1,6 +1,8 @@
 import os
 import uuid
 import json
+import base64
+import hashlib
 import asyncio
 import re
 import subprocess
@@ -24,6 +26,7 @@ from ensemble_db import (
     ensure_thread_row,
     init_db_tables,
     insert_message_return_id,
+    load_user_message_content_for_session,
     is_unique_violation,
     load_last_user_message,
     load_last_user_message_id,
@@ -87,7 +90,7 @@ GEMINI_FALLBACK_MODELS = list(MODEL_REGISTRY["gemini_fallback_chain"])
 
 FREE_USER_LIMIT = max(0, int(os.getenv("FREE_USER_LIMIT", "5") or "5"))
 
-CHAT_MODEL_KEYS = frozenset({"gpt", "gpt-fast", "gemini", "gemini-fast", "claude"})
+CHAT_MODEL_KEYS = frozenset({"gpt", "gpt-fast", "gemini", "gemini-fast", "claude", "ben"})
 
 _TIER_ROUTING_CTX: ContextVar[Optional["TierRouting"]] = ContextVar("_tier_routing_ctx", default=None)
 
@@ -781,6 +784,36 @@ print(
 # Sentinel: omit param to preserve DB value when calling save_profile
 _PROFILE_KEEP = object()
 
+
+def _encrypt_sensitive_field(plain: str) -> str:
+    """Store-at-rest obfuscation for date of birth (symmetric XOR + base64; key from JWT_SECRET)."""
+    s = (plain or "").strip()
+    if not s:
+        return ""
+    secret = (os.getenv("JWT_SECRET") or "ensemble-dev-default-secret").encode()
+    key = hashlib.sha256(secret + b"|ensemble-dob|").digest()
+    b = s.encode("utf-8")
+    xored = bytes(b[i] ^ key[i % len(key)] for i in range(len(b)))
+    return "x1:" + base64.urlsafe_b64encode(xored).decode("ascii")
+
+
+def build_language_instruction(profile: dict) -> str:
+    """Short instruction injected into model prompts for response language."""
+    lang = (profile.get("preferred_language") or "auto").strip().lower()
+    if lang in ("", "auto"):
+        return "Respond in the same language as the user's message."
+    labels = {
+        "en": "English",
+        "english": "English",
+        "he": "Hebrew",
+        "ar": "Arabic",
+        "ru": "Russian",
+        "other": "the user's preferred language",
+    }
+    label = labels.get(lang, lang)
+    return f"Always respond in {label}. Do not switch languages."
+
+
 # ========================
 # DATA MODELS
 # ========================
@@ -809,9 +842,10 @@ class ChatRequest(BaseModel):
 
 
 class AddAIRequest(BaseModel):
-    """Append another model answer for the latest user turn in the thread."""
+    """Append another model answer for a user turn (defaults to latest user message)."""
     thread_id: str
     model: str = "gpt"
+    source_message_id: Optional[str] = None
 
 
 class TestAIRequest(BaseModel):
@@ -840,6 +874,10 @@ class ProfileRequest(BaseModel):
     projects: Optional[str] = None
     preferences: Optional[str] = None
     memory_context: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    preferred_language: Optional[str] = None
+    ai_usage_category: Optional[str] = None
+    onboarding_completed: Optional[bool] = None
 
 
 class ActiveToolsRequest(BaseModel):
@@ -982,6 +1020,10 @@ def save_profile(
     memory_context=None,
     uploaded_text=_PROFILE_KEEP,
     active_tools=_PROFILE_KEEP,
+    preferred_language=_PROFILE_KEEP,
+    ai_usage_category=_PROFILE_KEEP,
+    onboarding_completed=_PROFILE_KEEP,
+    date_of_birth_plain=_PROFILE_KEEP,
 ):
     """Save or update a user's profile. Use sentinel _PROFILE_KEEP to leave blobs/tools unchanged."""
     conn = connect_db()
@@ -990,7 +1032,9 @@ def save_profile(
         c,
         """
         SELECT user_name, user_role, projects, preferences, memory_context, uploaded_text,
-               COALESCE(active_tools, ?)
+               COALESCE(active_tools, ?),
+               COALESCE(preferred_language, 'auto'), ai_usage_category,
+               COALESCE(onboarding_completed, 0), date_of_birth_encrypted
         FROM profiles WHERE session_id = ?
         """,
         (DEFAULT_ACTIVE_TOOLS_JSON, session_id),
@@ -1006,6 +1050,10 @@ def save_profile(
             current_context,
             current_uploaded,
             current_tools,
+            current_pl,
+            current_auc,
+            current_oc,
+            current_dob_enc,
         ) = existing
         user_name = user_name if user_name is not None else current_name
         user_role = user_role if user_role is not None else current_role
@@ -1022,10 +1070,28 @@ def save_profile(
             lst = normalize_active_tools_list(active_tools if isinstance(active_tools, list) else [])
             tools_use = json.dumps(lst)
 
+        if preferred_language is _PROFILE_KEEP:
+            pl_use = current_pl or "auto"
+        else:
+            pl_use = preferred_language or "auto"
+        if ai_usage_category is _PROFILE_KEEP:
+            auc_use = current_auc
+        else:
+            auc_use = ai_usage_category
+        if onboarding_completed is _PROFILE_KEEP:
+            oc_use = int(current_oc or 0)
+        else:
+            oc_use = 1 if onboarding_completed else 0
+        if date_of_birth_plain is _PROFILE_KEEP:
+            dob_use = current_dob_enc
+        else:
+            dob_use = _encrypt_sensitive_field(date_of_birth_plain) if (date_of_birth_plain or "").strip() else ""
+
         xe(c, """
             UPDATE profiles
             SET user_name = ?, user_role = ?, projects = ?, preferences = ?, memory_context = ?,
-                uploaded_text = ?, active_tools = ?, updated_at = ?
+                uploaded_text = ?, active_tools = ?, preferred_language = ?, ai_usage_category = ?,
+                onboarding_completed = ?, date_of_birth_encrypted = ?, updated_at = ?
             WHERE session_id = ?
         """, (
             user_name,
@@ -1035,6 +1101,10 @@ def save_profile(
             memory_context,
             uploaded_use,
             tools_use,
+            pl_use,
+            auc_use,
+            oc_use,
+            dob_use,
             datetime.now().isoformat(),
             session_id,
         ))
@@ -1045,11 +1115,21 @@ def save_profile(
         else:
             tools_ins = json.dumps(normalize_active_tools_list(active_tools if isinstance(active_tools, list) else []))
 
+        pl_ins = "auto"
+        if preferred_language is not _PROFILE_KEEP:
+            pl_ins = preferred_language or "auto"
+        auc_ins = None if ai_usage_category is _PROFILE_KEEP else ai_usage_category
+        oc_ins = 0 if onboarding_completed is _PROFILE_KEEP else (1 if onboarding_completed else 0)
+        dob_ins = ""
+        if date_of_birth_plain is not _PROFILE_KEEP:
+            dob_ins = _encrypt_sensitive_field(date_of_birth_plain) if (date_of_birth_plain or "").strip() else ""
+
         xe(c, """
             INSERT INTO profiles (
                 session_id, user_name, user_role, projects, preferences, memory_context,
-                uploaded_text, active_tools, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                uploaded_text, active_tools, preferred_language, ai_usage_category,
+                onboarding_completed, date_of_birth_encrypted, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             session_id,
             user_name,
@@ -1059,6 +1139,10 @@ def save_profile(
             memory_context,
             up_ins,
             tools_ins,
+            pl_ins,
+            auc_ins,
+            oc_ins,
+            dob_ins,
             datetime.now().isoformat(),
         ))
 
@@ -1074,7 +1158,9 @@ def get_profile(session_id):
         c,
         """
         SELECT user_name, user_role, projects, preferences, memory_context, uploaded_text,
-               COALESCE(active_tools, ?)
+               COALESCE(active_tools, ?),
+               COALESCE(preferred_language, 'auto'), ai_usage_category,
+               COALESCE(onboarding_completed, 0), date_of_birth_encrypted
         FROM profiles WHERE session_id = ?
         """,
         (DEFAULT_ACTIVE_TOOLS_JSON, session_id),
@@ -1093,6 +1179,10 @@ def get_profile(session_id):
         "memory_context": row[4],
         "uploaded_text": row[5],
         "active_tools": row[6],
+        "preferred_language": row[7],
+        "ai_usage_category": row[8],
+        "onboarding_completed": bool(row[9]),
+        "date_of_birth_encrypted": row[10],
     }
 
 
@@ -1102,6 +1192,7 @@ def profile_for_client(profile):
         return None
     d = dict(profile)
     txt = (d.pop("uploaded_text", None) or "").strip()
+    d.pop("date_of_birth_encrypted", None)
     d["has_uploaded_document"] = bool(txt)
     if txt:
         d["uploaded_char_count"] = len(txt)
@@ -1111,6 +1202,8 @@ def profile_for_client(profile):
     except Exception:
         parsed = json.loads(DEFAULT_ACTIVE_TOOLS_JSON)
     d["active_tools"] = normalize_active_tools_list(parsed if isinstance(parsed, list) else [])
+    if "onboarding_completed" not in d:
+        d["onboarding_completed"] = False
     return d
 
 
@@ -1186,6 +1279,7 @@ def build_profile_context(session_id):
         return []
 
     parts = []
+    lang_line = build_language_instruction(profile)
     if profile.get("user_name"):
         parts.append(f"Name: {profile['user_name']}")
     if profile.get("user_role"):
@@ -1198,10 +1292,11 @@ def build_profile_context(session_id):
         parts.append(f"Context from past conversations: {profile['memory_context']}")
 
     if not parts:
-        return []
+        content = lang_line
+        return [{"role": "user", "content": content}]
 
     content = (
-        "Please remember the user profile and context for this conversation.\n"
+        lang_line + "\n\nPlease remember the user profile and context for this conversation.\n"
         + "\n".join(parts)
     )
     return [{"role": "user", "content": content}]
@@ -1355,7 +1450,8 @@ async def ask_gemini(prompt, session_id=None, model=None):
         return "GEMINI Error: Gemini client unavailable. Set GEMINI_KEY or check initialization."
     if session_id:
         profile_text = ""
-        profile = get_profile(session_id)
+        profile = get_profile(session_id) or {}
+        lang_line = build_language_instruction(profile) + "\n\n" if profile else ""
         if profile:
             profile_text = f"User Profile: Name={profile.get('user_name')}, Role={profile.get('user_role')}, Projects={profile.get('projects')}\n"
 
@@ -1364,7 +1460,7 @@ async def ask_gemini(prompt, session_id=None, model=None):
         for role, content in history:
             history_text += f"{role.upper()}: {content}\n"
 
-        contents = f"{profile_text}\n{history_text}\nUSER: {prompt}"
+        contents = f"{lang_line}{profile_text}\n{history_text}\nUSER: {prompt}"
     else:
         contents = prompt
 
@@ -1410,13 +1506,21 @@ async def ask_claude(prompt, session_id=None, system_prompt=None, model=None):
     model_order = [eff_model] + [m for m in effective_claude_fallbacks_for_call() if m != eff_model]
     last_error = None
     for candidate in model_order:
+        merged_parts = []
+        if system_prompt:
+            merged_parts.append(system_prompt)
+        if session_id:
+            lip = build_language_instruction(get_profile(session_id) or {})
+            if lip:
+                merged_parts.append(lip)
+        merged_sys = "\n\n".join(merged_parts).strip() if merged_parts else None
         kwargs = {
             "model": candidate,
             "max_tokens": 1000,
             "messages": messages
         }
-        if system_prompt:
-            kwargs["system"] = system_prompt
+        if merged_sys:
+            kwargs["system"] = merged_sys
         try:
             message = await claude_client.messages.create(**kwargs)
             return message.content[0].text
@@ -2084,7 +2188,8 @@ async def stream_gemini_tokens(prompt, session_id=None, model=None):
         return
     if session_id:
         profile_text = ""
-        profile = get_profile(session_id)
+        profile = get_profile(session_id) or {}
+        lang_line = build_language_instruction(profile) + "\n\n" if profile else ""
         if profile:
             profile_text = (
                 f"User Profile: Name={profile.get('user_name')}, Role={profile.get('user_role')}, "
@@ -2094,7 +2199,7 @@ async def stream_gemini_tokens(prompt, session_id=None, model=None):
         history = get_conversation_history(session_id)
         for role, content in history:
             history_text += f"{role.upper()}: {content}\n"
-        full_prompt = f"{profile_text}\n{history_text}\nUSER: {prompt}"
+        full_prompt = f"{lang_line}{profile_text}\n{history_text}\nUSER: {prompt}"
     else:
         full_prompt = prompt
 
@@ -2145,9 +2250,17 @@ async def stream_claude_tokens(prompt, session_id=None, system_prompt=None, mode
     model_order = [eff_model] + [m for m in effective_claude_fallbacks_for_call() if m != eff_model]
     last_error = None
     for candidate in model_order:
-        kwargs = {"model": candidate, "max_tokens": 1000, "messages": msgs}
+        merged_parts = []
         if system_prompt:
-            kwargs["system"] = system_prompt
+            merged_parts.append(system_prompt)
+        if session_id:
+            lip = build_language_instruction(get_profile(session_id) or {})
+            if lip:
+                merged_parts.append(lip)
+        merged_sys = "\n\n".join(merged_parts).strip() if merged_parts else None
+        kwargs = {"model": candidate, "max_tokens": 1000, "messages": msgs}
+        if merged_sys:
+            kwargs["system"] = merged_sys
         try:
             async with claude_client.messages.stream(**kwargs) as stream:
                 async for text in stream.text_stream:
@@ -2166,6 +2279,21 @@ async def stream_claude_tokens(prompt, session_id=None, system_prompt=None, mode
             raise
     if last_error:
         raise last_error
+
+
+async def stream_ben_synthesis_tokens(prompt: str, session_id: str):
+    """Stream BEN synthesis text using tier routing (GPT or Claude)."""
+    tr = current_tier_routing()
+    if tr and not tr.ben_use_claude:
+        async for t in stream_gpt_tokens(prompt, session_id, model=tr.openai_main):
+            yield t
+    else:
+        async for t in stream_claude_tokens(
+            prompt,
+            session_id,
+            system_prompt="You are BEN. Merge analyst outputs into one coherent answer.",
+        ):
+            yield t
 
 
 async def stream_round1_model(model_key: str, prompt: str, session_id: str):
@@ -2548,7 +2676,7 @@ def get_session_history(session_id: str):
     
     # Get all messages
     xe(c, """
-        SELECT model, role, content, timestamp FROM messages 
+        SELECT id, model, role, content, timestamp FROM messages 
         WHERE session_id = ? 
         ORDER BY timestamp ASC
     """, (session_id,))
@@ -2571,10 +2699,11 @@ def get_session_history(session_id: str):
         "trial_count": trial_count,
         "messages": [
             {
-                "model": msg[0],
-                "role": msg[1],
-                "content": msg[2],
-                "timestamp": msg[3]
+                "id": msg[0],
+                "model": msg[1],
+                "role": msg[2],
+                "content": msg[3],
+                "timestamp": msg[4]
             }
             for msg in messages
         ]
@@ -2591,6 +2720,16 @@ def update_session_profile(session_id: str, req: ProfileRequest):
         return {"success": False, "error": "Session not found"}
     conn.close()
 
+    kw = {}
+    if req.date_of_birth is not None:
+        kw["date_of_birth_plain"] = req.date_of_birth
+    if req.preferred_language is not None:
+        kw["preferred_language"] = req.preferred_language
+    if req.ai_usage_category is not None:
+        kw["ai_usage_category"] = req.ai_usage_category
+    if req.onboarding_completed is not None:
+        kw["onboarding_completed"] = req.onboarding_completed
+
     save_profile(
         session_id,
         user_name=req.user_name,
@@ -2598,6 +2737,7 @@ def update_session_profile(session_id: str, req: ProfileRequest):
         projects=req.projects,
         preferences=req.preferences,
         memory_context=req.memory_context,
+        **kw,
     )
 
     return {"success": True, "session_id": session_id, "profile": profile_for_client(get_profile(session_id))}
@@ -3236,6 +3376,8 @@ async def api_chat(req: ChatRequest):
     mk = (req.model or "gpt").strip().lower()
     if mk not in CHAT_MODEL_KEYS:
         raise HTTPException(status_code=400, detail="invalid model")
+    if mk == "ben":
+        raise HTTPException(status_code=400, detail="invalid model for this endpoint")
     if routing.tier != "pro" and mk == "claude":
         raise HTTPException(status_code=403, detail="Claude is available on Pro tier")
 
@@ -3292,12 +3434,20 @@ async def add_ai_to_thread(req: AddAIRequest):
     ensure_thread_row(tid)
     ensure_session_exists(tid)
 
-    user_message = load_last_user_message(tid).strip()
-    if not user_message:
-        raise HTTPException(status_code=400, detail="no user message in thread")
-    message_id = load_last_user_message_id(tid)
-    if not message_id:
-        raise HTTPException(status_code=400, detail="no user message in thread")
+    src = (req.source_message_id or "").strip()
+    if src:
+        umsg = load_user_message_content_for_session(tid, src)
+        if not umsg or not umsg.strip():
+            raise HTTPException(status_code=400, detail="invalid source_message_id")
+        message_id = str(src)
+        user_message = umsg.strip()
+    else:
+        user_message = load_last_user_message(tid).strip()
+        if not user_message:
+            raise HTTPException(status_code=400, detail="no user message in thread")
+        message_id = load_last_user_message_id(tid)
+        if not message_id:
+            raise HTTPException(status_code=400, detail="no user message in thread")
 
     mk = (req.model or "gpt").strip().lower()
     if mk not in CHAT_MODEL_KEYS:
@@ -3307,6 +3457,38 @@ async def add_ai_to_thread(req: AddAIRequest):
 
     is_pro = _resolve_trial_is_pro(tid)
     enforce_ensemble_rate_limit(tid, is_pro)
+
+    if mk == "ben":
+
+        async def gen_ben():
+            tr_token = _TIER_ROUTING_CTX.set(routing)
+            try:
+                responses_pre = load_model_responses(tid, message_id)
+                raw_only = [r for r in responses_pre if not r["is_ben_synthesis"]]
+                if len(raw_only) < 2:
+                    yield f"data: {json.dumps({'type': 'error', 'content': 'At least two model answers are required for BEN synthesis.'})}\n\n"
+                    return
+                body = "\n\n".join(f"--- {r['model']} ---\n{r['content']}" for r in raw_only)
+                prompt = (
+                    "You are BEN. Synthesize the analyst responses below into one coherent English answer. "
+                    "Use clear structure.\n\n"
+                    + body
+                )
+                parts: list[str] = []
+                async for piece in stream_ben_synthesis_tokens(prompt, tid):
+                    parts.append(piece)
+                    yield f"data: {json.dumps({'type': 'chunk', 'content': piece})}\n\n"
+                full = "".join(parts)
+                rid = save_model_response(tid, message_id, "ben", full, is_ben_synthesis=True)
+                touch_thread(tid)
+                update_session_timestamp(tid)
+                yield f"data: {json.dumps({'type': 'done', 'thread_id': tid, 'message_id': message_id, 'response_id': rid, 'model': 'ben'})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            finally:
+                _TIER_ROUTING_CTX.reset(tr_token)
+
+        return StreamingResponse(gen_ben(), media_type="text/event-stream")
 
     async def gen():
         tr_token = _TIER_ROUTING_CTX.set(routing)
@@ -3408,7 +3590,14 @@ async def run_ensemble_stream(req: RunRequest):
             conn.commit()
             conn.close()
 
-            save_message(req.session_id, "ensemble", "user", req.question)
+            user_msg_id = insert_message_return_id(req.session_id, "ensemble", "user", req.question)
+            yield emit(
+                {
+                    "type": "user_turn",
+                    "message_id": str(user_msg_id),
+                    "thread_id": req.session_id,
+                }
+            )
             token_saver_mode = get_token_saver_mode(req.question)
 
             def _pipe(step: int, label: str):

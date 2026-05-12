@@ -464,6 +464,19 @@ def _migrate_sqlite(conn: sqlite3.Connection) -> None:
             c.execute("ALTER TABLE profiles ADD COLUMN active_tools TEXT")
         except sqlite3.OperationalError:
             pass
+    for col_sql in (
+        "ALTER TABLE profiles ADD COLUMN date_of_birth_encrypted TEXT",
+        "ALTER TABLE profiles ADD COLUMN preferred_language TEXT DEFAULT 'auto'",
+        "ALTER TABLE profiles ADD COLUMN ai_usage_category TEXT",
+        "ALTER TABLE profiles ADD COLUMN onboarding_completed INTEGER DEFAULT 0",
+    ):
+        col_name = col_sql.split("ADD COLUMN ")[1].split(" ")[0]
+        if col_name not in cols:
+            try:
+                c.execute(col_sql)
+                cols.add(col_name)
+            except sqlite3.OperationalError:
+                pass
 
     c.execute(
         """
@@ -614,6 +627,15 @@ def _migrate_postgres(conn: Any) -> None:
         c.execute("ALTER TABLE profiles ADD COLUMN uploaded_text TEXT")
     if "active_tools" not in cols:
         c.execute("ALTER TABLE profiles ADD COLUMN active_tools TEXT")
+    for col_name, col_type in (
+        ("date_of_birth_encrypted", "TEXT"),
+        ("preferred_language", "TEXT DEFAULT 'auto'"),
+        ("ai_usage_category", "TEXT"),
+        ("onboarding_completed", "INTEGER DEFAULT 0"),
+    ):
+        if col_name not in cols:
+            c.execute(f"ALTER TABLE profiles ADD COLUMN {col_name} {col_type}")
+            cols.add(col_name)
 
     c.execute(
         """
@@ -928,3 +950,24 @@ def insert_message_return_id(session_id: str, model: str, role: str, content: st
     conn.commit()
     conn.close()
     return mid
+
+
+def load_user_message_content_for_session(session_id: str, message_id: str) -> Optional[str]:
+    """Return user message content if id belongs to session and role is user."""
+    if not session_id or not str(message_id).strip():
+        return None
+    try:
+        mid = int(message_id)
+    except (TypeError, ValueError):
+        return None
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute(
+        adapt("SELECT role, content FROM messages WHERE session_id = ? AND id = ?"),
+        (session_id, mid),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row or row[0] != "user":
+        return None
+    return row[1] or ""
