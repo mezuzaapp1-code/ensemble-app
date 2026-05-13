@@ -7,8 +7,6 @@ import subprocess
 import tempfile
 import time
 import io
-from contextvars import ContextVar
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Optional
 from pathlib import Path
@@ -100,123 +98,33 @@ GEMINI_FALLBACK_MODELS = list(MODEL_REGISTRY["gemini_fallback_chain"])
 
 FREE_USER_LIMIT = max(0, int(os.getenv("FREE_USER_LIMIT", "5") or "5"))
 
-CHAT_MODEL_KEYS = frozenset({"gpt", "gpt-fast", "gemini", "gemini-fast", "claude", "ben"})
+from routing import (
+    CHAT_MODEL_KEYS,
+    TIER_ROUTING_CTX,
+    _ben_placeholder_mixed_failure_success,
+    _gemini_candidate_models,
+    _run_with_routing,
+    _stored_label_for_model_key,
+    compute_ben_r1_lane_plan,
+    current_tier_routing,
+    effective_claude_fallbacks_for_call,
+    effective_claude_primary,
+    effective_gemini_default,
+    effective_openai_default,
+    get_token_saver_mode,
+    install_model_defaults,
+    prepare_workspace_tools_for_ensemble,
+    routing_for_db_tier,
+    routing_tier_label,
+)
 
-_TIER_ROUTING_CTX: ContextVar[Optional["TierRouting"]] = ContextVar("_tier_routing_ctx", default=None)
-
-
-@dataclass(frozen=True)
-class TierRouting:
-    tier: str
-    openai_main: str
-    openai_fast: str
-    gemini_main: str
-    claude_main: Optional[str]
-    claude_fallbacks: tuple[str, ...]
-    ben_use_claude: bool
-
-
-def routing_for_db_tier(db_tier: Optional[str]) -> TierRouting:
-    t = (db_tier or "free").strip().lower()
-    if t == "pro":
-        return TierRouting(
-            tier="pro",
-            openai_main="gpt-4o",
-            openai_fast="gpt-4o",
-            gemini_main="gemini-1.5-pro",
-            claude_main="claude-3-5-sonnet-20241022",
-            claude_fallbacks=("claude-3-5-sonnet-20241022",),
-            ben_use_claude=True,
-        )
-    return TierRouting(
-        tier="free",
-        openai_main="gpt-4o-mini",
-        openai_fast="gpt-4o-mini",
-        gemini_main="gemini-1.5-flash",
-        claude_main=None,
-        claude_fallbacks=(),
-        ben_use_claude=False,
-    )
-
-
-def current_tier_routing() -> Optional[TierRouting]:
-    return _TIER_ROUTING_CTX.get()
-
-
-def effective_openai_default(model_key_hint: Optional[str] = None) -> str:
-    tr = current_tier_routing()
-    if tr:
-        if model_key_hint == "gpt-fast":
-            return tr.openai_fast
-        return tr.openai_main
-    return OPENAI_DEFAULT_MODEL
-
-
-def effective_gemini_default() -> str:
-    tr = current_tier_routing()
-    return tr.gemini_main if tr else GEMINI_FAST_MODEL
-
-
-def effective_claude_primary() -> Optional[str]:
-    tr = current_tier_routing()
-    if tr:
-        return tr.claude_main
-    return CLAUDE_MODEL
-
-
-def effective_claude_fallbacks_for_call() -> tuple[str, ...]:
-    tr = current_tier_routing()
-    if tr:
-        return tr.claude_fallbacks
-    return tuple(CLAUDE_FALLBACK_MODELS)
-
-
-async def _run_with_routing(routing: TierRouting, coro: Any):
-    tok = _TIER_ROUTING_CTX.set(routing)
-    try:
-        return await coro
-    finally:
-        _TIER_ROUTING_CTX.reset(tok)
-
-
-def _stored_label_for_model_key(model_key: str) -> str:
-    mk = (model_key or "").strip().lower()
-    if mk == "gpt":
-        return effective_openai_default()
-    if mk == "gpt-fast":
-        return effective_openai_default("gpt-fast")
-    if mk in ("gemini", "gemini-fast"):
-        return effective_gemini_default()
-    if mk == "claude":
-        return effective_claude_primary() or CLAUDE_MODEL
-    return mk
-
-
-def _ben_placeholder_mixed_failure_success(texts: list[str]) -> bool:
-    if len(texts) < 2:
-        return False
-
-    def _failed(t: str) -> bool:
-        x = (t or "").lower()
-        return (
-            " error:" in x
-            or x.startswith("gpt error")
-            or x.startswith("claude error")
-            or x.startswith("gemini error")
-        )
-
-    flags = [_failed(t) for t in texts]
-    return any(flags) and not all(flags)
-
-
-def _gemini_candidate_models(primary: str) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for m in (primary, *GEMINI_FALLBACK_MODELS):
-        if m and m not in seen:
-            seen.add(m)
-            out.append(m)
-    return out
+install_model_defaults(
+    openai_default=OPENAI_DEFAULT_MODEL,
+    gemini_fast=GEMINI_FAST_MODEL,
+    claude_primary=CLAUDE_MODEL,
+    claude_fallbacks=tuple(CLAUDE_FALLBACK_MODELS),
+    gemini_fallbacks=tuple(GEMINI_FALLBACK_MODELS),
+)
 
 
 def _create_openai_client():
@@ -415,14 +323,6 @@ def consensus_agreement_pct(consensus_data) -> float:
         if "HIGH" in st:
             high += 1
     return round(100.0 * high / n, 1) if n else 0.0
-
-
-def routing_tier_label(token_saver_mode: str, web_search: bool) -> str:
-    if token_saver_mode == "ECONOMY":
-        return "Economy"
-    if web_search:
-        return "Premium"
-    return "Standard"
 
 
 SYSTEM_INSTRUCTIONS_FILE = _BASE_DIR / "system_instructions.txt"
@@ -1335,32 +1235,6 @@ def _ensemble_normalize(value, model_key: str) -> str:
 def _estimate_tokens(text: str) -> int:
     # Lightweight approximation for cost telemetry
     return max(1, len((text or "").strip()) // 4) if (text or "").strip() else 0
-
-def get_token_saver_mode(prompt: str) -> str:
-    """
-    Heuristic mode selector:
-    - ECONOMY for short/simple asks
-    - FULL for complex asks
-    """
-    text = (prompt or "").strip()
-    if not text:
-        return "ECONOMY"
-    words = len(text.split())
-    has_complex_signals = any(k in text.lower() for k in [
-        "compare",
-        "architecture",
-        "scalability",
-        "security",
-        "tradeoff",
-        "step-by-step",
-        "detailed",
-        "multi",
-        "benchmark",
-    ])
-    punctuation_load = sum(text.count(ch) for ch in [":", ";", "?", "(", ")", ",", "\n"])
-    if words <= 18 and punctuation_load <= 3 and not has_complex_signals:
-        return "ECONOMY"
-    return "FULL"
 
 
 def is_product_idea_question(prompt: str) -> bool:
@@ -2560,7 +2434,7 @@ async def run_ensemble(req: RunRequest):
                 conn.close()
                 raise HTTPException(status_code=403, detail={"error": "LIMIT_REACHED"})
         record_user_ensemble_message(_uid)
-        tr_tok = _TIER_ROUTING_CTX.set(routing)
+        tr_tok = TIER_ROUTING_CTX.set(routing)
 
         profile = get_profile(req.session_id)
         user_id = trial_usage_identifier(req.session_id, profile)
@@ -2649,35 +2523,14 @@ Apply these learned weights automatically to prioritize the advice of the most a
         uploaded_block = get_uploaded_prompt_injection(req.session_id)
 
         token_saver_mode = get_token_saver_mode(req.question)
-        active_workspace_tools = get_profile_active_tool_set(req.session_id)
-        tier_allowed = {"gpt", "gemini"} if routing.tier == "free" else {"gpt", "gemini", "claude"}
-        active_workspace_tools = sorted(set(active_workspace_tools) & tier_allowed)
-        if not active_workspace_tools:
-            active_workspace_tools = ["gpt"]
-        ben_tool_order = ["gpt", "gemini", "claude"]
-        econ_lane_notice = "[Maintenance] Token saver mode: model skipped for cost efficiency."
-        lane_off_notice = "(BEN Workspace: this analyst is turned off.)"
-
-        if token_saver_mode == "ECONOMY":
-            routed_models = []
-            if "gpt" in active_workspace_tools:
-                routed_models.append("gpt")
-        else:
-            routed_models = [m for m in ben_tool_order if m in active_workspace_tools]
-        if not routed_models:
-            routed_models = ["gpt"]
-
-        skip_lane_r1_msgs: dict[str, str] = {}
-        tier_free_lane = "(BEN Free tier: Claude is available on BEN Pro.)"
-        for mm in ben_tool_order:
-            if mm in routed_models:
-                continue
-            if mm == "claude" and routing.tier == "free":
-                skip_lane_r1_msgs[mm] = tier_free_lane
-            else:
-                skip_lane_r1_msgs[mm] = (
-                    econ_lane_notice if token_saver_mode == "ECONOMY" and mm != "gpt" else lane_off_notice
-                )
+        active_workspace_tools = prepare_workspace_tools_for_ensemble(
+            get_profile_active_tool_set(req.session_id), routing.tier
+        )
+        ben_tool_order, routed_models, skip_lane_r1_msgs = compute_ben_r1_lane_plan(
+            token_saver_mode=token_saver_mode,
+            active_workspace_tools=active_workspace_tools,
+            tier=routing.tier,
+        )
 
         # =========================
         # ROUND 1
@@ -2937,7 +2790,7 @@ Find contradictions, shallow thinking, hidden assumptions, strategic weaknesses,
         }
     finally:
         if tr_tok is not None:
-            _TIER_ROUTING_CTX.reset(tr_tok)
+            TIER_ROUTING_CTX.reset(tr_tok)
 
 @app.post("/upload")
 async def upload_global(session_id: str = Form(...), file: UploadFile = File(...)):
@@ -3040,7 +2893,7 @@ async def api_chat(req: ChatRequest):
     enforce_ensemble_rate_limit(tid, is_pro)
 
     async def gen():
-        tr_token = _TIER_ROUTING_CTX.set(routing)
+        tr_token = TIER_ROUTING_CTX.set(routing)
         try:
             message_id = insert_message_return_id(tid, "chat", "user", msg)
             parts: list[str] = []
@@ -3057,7 +2910,7 @@ async def api_chat(req: ChatRequest):
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
         finally:
-            _TIER_ROUTING_CTX.reset(tr_token)
+            TIER_ROUTING_CTX.reset(tr_token)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -3107,7 +2960,7 @@ async def add_ai_to_thread(req: AddAIRequest):
     if mk == "ben":
 
         async def gen_ben():
-            tr_token = _TIER_ROUTING_CTX.set(routing)
+            tr_token = TIER_ROUTING_CTX.set(routing)
             try:
                 responses_pre = load_model_responses(tid, message_id)
                 raw_only = [r for r in responses_pre if not r["is_ben_synthesis"]]
@@ -3132,12 +2985,12 @@ async def add_ai_to_thread(req: AddAIRequest):
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
             finally:
-                _TIER_ROUTING_CTX.reset(tr_token)
+                TIER_ROUTING_CTX.reset(tr_token)
 
         return StreamingResponse(gen_ben(), media_type="text/event-stream")
 
     async def gen():
-        tr_token = _TIER_ROUTING_CTX.set(routing)
+        tr_token = TIER_ROUTING_CTX.set(routing)
         try:
             parts: list[str] = []
             async for piece in stream_round1_model(mk, user_message, tid):
@@ -3157,7 +3010,7 @@ async def add_ai_to_thread(req: AddAIRequest):
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
         finally:
-            _TIER_ROUTING_CTX.reset(tr_token)
+            TIER_ROUTING_CTX.reset(tr_token)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -3224,7 +3077,7 @@ async def run_ensemble_stream(req: RunRequest):
         def emit(payload: dict) -> str:
             # SSE framing: one JSON event per data line
             return f"data: {json.dumps(payload)}\n\n"
-        tr_var = _TIER_ROUTING_CTX.set(routing)
+        tr_var = TIER_ROUTING_CTX.set(routing)
         try:
             conn = connect_db()
             c = conn.cursor()
@@ -3262,11 +3115,9 @@ async def run_ensemble_stream(req: RunRequest):
             category = (await ask_model_timed("gpt-fast", category_prompt, None, STREAM_R2_TIMEOUT_SEC)).strip().lower()
 
             ensemble_wall_loop_start = asyncio.get_running_loop().time()
-            active_workspace_tools = get_profile_active_tool_set(req.session_id)
-            tier_allowed = {"gpt", "gemini"} if routing.tier == "free" else {"gpt", "gemini", "claude"}
-            active_workspace_tools = sorted(set(active_workspace_tools) & tier_allowed)
-            if not active_workspace_tools:
-                active_workspace_tools = ["gpt"]
+            active_workspace_tools = prepare_workspace_tools_for_ensemble(
+                get_profile_active_tool_set(req.session_id), routing.tier
+            )
 
             web_data = ""
             if req.web_search:
@@ -3288,28 +3139,11 @@ async def run_ensemble_stream(req: RunRequest):
             gem_r1 = f"Analyst: Gemini. Implementation view. Question: {q_with_web}"
             claude_r1 = f"Analyst: Claude. Strategic/Reasoning view. Question: {q_with_web}"
 
-            ben_tool_order = ["gpt", "gemini", "claude"]
-            econ_lane_notice = "[Maintenance] Token saver mode: model skipped for cost efficiency."
-            lane_off_notice = "(BEN Workspace: this analyst is turned off.)"
-
-            if token_saver_mode == "ECONOMY":
-                routed_models = []
-                if "gpt" in active_workspace_tools:
-                    routed_models.append("gpt")
-            else:
-                routed_models = [m for m in ben_tool_order if m in active_workspace_tools]
-            if not routed_models:
-                routed_models = ["gpt"]
-
-            skip_lane_banner: dict[str, str] = {}
-            tier_free_lane = "(BEN Free tier: Claude is available on BEN Pro.)"
-            for mm in ben_tool_order:
-                if mm in routed_models:
-                    continue
-                if mm == "claude" and routing.tier == "free":
-                    skip_lane_banner[mm] = tier_free_lane
-                else:
-                    skip_lane_banner[mm] = econ_lane_notice if token_saver_mode == "ECONOMY" and mm != "gpt" else lane_off_notice
+            ben_tool_order, routed_models, skip_lane_banner = compute_ben_r1_lane_plan(
+                token_saver_mode=token_saver_mode,
+                active_workspace_tools=active_workspace_tools,
+                tier=routing.tier,
+            )
 
             evt_q = asyncio.Queue()
             round1_live: dict[str, str] = {"gpt": "", "gemini": "", "claude": ""}
@@ -3672,7 +3506,7 @@ async def run_ensemble_stream(req: RunRequest):
                 }
             )
         finally:
-            _TIER_ROUTING_CTX.reset(tr_var)
+            TIER_ROUTING_CTX.reset(tr_var)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
